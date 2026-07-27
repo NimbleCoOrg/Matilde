@@ -112,3 +112,42 @@ def test_reference_from_args_coerces_string_authors_and_year():
     assert ref.authors == ["Vaswani", "Shazeer"]
     assert ref.year == 2017
     assert ref.doi == "10.1/x"
+
+
+def test_manifest_provides_tools_matches_registry():
+    """plugin.yaml's ``provides_tools`` must equal the registered tool names.
+
+    These drifted apart silently: the manifest declared 7 tools while the plugin
+    registered 11, so the whole study pipeline (``matilde_study_*``) was invisible
+    to any host that trusts the manifest to enumerate the capability surface. No
+    test compared the two, which is why nobody noticed across six feature PRs.
+
+    Parsed with a deliberately small reader rather than PyYAML: the offline suite
+    has no third-party dependencies and this guard is not worth adding one.
+    """
+    plugin = _load_plugin()
+    registered = [name for name, _schema, _handler, _emoji in plugin._TOOLS]
+
+    manifest_path = os.path.join(ROOT, "matilde_plugin", "plugin.yaml")
+    with open(manifest_path, encoding="utf-8") as fh:
+        lines = fh.read().splitlines()
+
+    declared = []
+    in_block = False
+    for line in lines:
+        if line.startswith("provides_tools:"):
+            in_block = True
+            continue
+        if in_block:
+            stripped = line.strip()
+            if stripped.startswith("- "):
+                declared.append(stripped[2:].strip().strip('"').strip("'"))
+            elif stripped and not stripped.startswith("#"):
+                break  # a new top-level key ends the list
+
+    assert declared, "could not parse provides_tools out of plugin.yaml"
+    assert declared == registered, (
+        "plugin.yaml provides_tools is out of sync with _TOOLS.\n"
+        f"  declared only:   {sorted(set(declared) - set(registered))}\n"
+        f"  registered only: {sorted(set(registered) - set(declared))}"
+    )

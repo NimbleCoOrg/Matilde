@@ -9,7 +9,7 @@
 
 name: "matilde"
 
-version: "0.1.0"
+version: "0.2.0"
 
 description: "Matilde — academic research assistant: verifiable citations (Crossref/OpenAlex/DataCite + retraction), legal open-access full-text retrieval (OpenAlex/Unpaywall/arXiv), and OpenNeuro/BIDS dataset discovery."
 
@@ -21,6 +21,10 @@ kind: standalone
 # API/S3 are all free and unauthenticated. MATILDE_CONTACT_EMAIL is optional
 # (joins providers' polite pools) and is therefore NOT listed as required env.
 
+# MUST stay in sync, in order, with ``_TOOLS`` in __init__.py. A manifest that
+# under-declares is not a cosmetic mismatch: a host that trusts it will not
+# surface the undeclared tools at all. Enforced by
+# tests/test_plugin_tools.py::test_manifest_provides_tools_matches_registry.
 provides_tools:
   - "matilde_verify_citation"
   - "matilde_verify_bibliography"
@@ -29,3 +33,7 @@ provides_tools:
   - "matilde_openneuro_search"
   - "matilde_openneuro_list_files"
   - "matilde_fetch_fulltext"
+  - "matilde_study_create"
+  - "matilde_study_run"
+  - "matilde_study_status"
+  - "matilde_study_list"
