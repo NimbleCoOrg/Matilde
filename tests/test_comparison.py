@@ -109,7 +109,32 @@ def test_declared_none_differs_from_absent():
     declared = Criterion(iou_threshold=0.3, overlap_threshold=None)
     absent = Criterion(iou_threshold=0.3)
     assert declared != absent
-    assert ("overlap_threshold", None, "<absent>") in declared.differences(absent)
+    # Assert the SEMANTICS, not the sentinel's value. This previously asserted the
+    # literal string "<absent>", which coupled the test to an implementation detail
+    # — and that detail was the bug: a field whose value was the string "<absent>"
+    # was indistinguishable from an absent field, so differences() could return []
+    # for unequal criteria. The marker is now a unique object.
+    diff = dict((f, (a, b)) for f, a, b in declared.differences(absent))
+    assert "overlap_threshold" in diff
+    mine, theirs = diff["overlap_threshold"]
+    assert mine is None                      # declared, explicitly no fallback
+    assert theirs is not None                # absent — some marker, not None
+    assert not isinstance(theirs, (int, float, str, bool))
+
+
+def test_absent_marker_cannot_collide_with_a_real_value():
+    """A field whose value is the string "<absent>" must still count as a difference.
+
+    Regression: `differences()` used the literal string "<absent>" as its
+    missing-field marker, so this pair compared unequal via `__eq__` while
+    `differences()` returned [] — and `compare()`, which gated on `differences()`,
+    computed a delta between two incomparable arms. Found in review.
+    """
+    tricky = Criterion(iou_threshold=0.3, extra="<absent>")
+    plain = Criterion(iou_threshold=0.3)
+    assert tricky != plain
+    assert tricky.differences(plain), (
+        "a field valued '<absent>' must not be mistaken for an absent field")
 
 
 def test_differences_names_which_field_disagrees():

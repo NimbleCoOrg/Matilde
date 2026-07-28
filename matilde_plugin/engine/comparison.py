@@ -115,6 +115,11 @@ def n_units_from_counts(block: Mapping | None,
 # Criterion
 # ---------------------------------------------------------------------------
 
+# Unique missing-field marker. Deliberately not a string: any string could
+# collide with a real field value (see Criterion.differences).
+_ABSENT = object()
+
+
 class Criterion:
     """A scoring criterion as comparable data, not prose.
 
@@ -187,8 +192,14 @@ class Criterion:
         mine, theirs = self.fields, other.fields
         out = []
         for k in sorted(set(mine) | set(theirs)):
-            a = mine.get(k, "<absent>") if k in mine else "<absent>"
-            b = theirs.get(k, "<absent>") if k in theirs else "<absent>"
+            # _ABSENT is a unique object, not the string "<absent>". A field whose
+            # VALUE was the literal "<absent>" used to be indistinguishable from an
+            # absent field, so differences() returned [] for two criteria that were
+            # not equal — and compare(), which gated on differences(), let the delta
+            # through. Contrived input, exactly the bug class this module exists to
+            # refuse. Found in review.
+            a = mine.get(k, _ABSENT)
+            b = theirs.get(k, _ABSENT)
             if a != b:
                 out.append((k, a, b))
         return out
@@ -468,7 +479,8 @@ def register_baseline(name: str, fn: Callable | None, params: Mapping[str, Any],
     """Register an arm as callable + params + split + criterion + source.
 
     THE INCIDENT THIS PREVENTS: the comparator used to be the string
-    `"Baseline: P=0.860, R=0.636, F1=0.731"`, printed by eight scripts. It
+    `"Baseline: P=0.860, R=0.636, F1=0.731"`, printed by seven scripts (an eighth
+    fed a different hardcoded constant into a delta). It
     reached a job-completion notification, was read back as a measurement, and
     became "the new model still beats the baseline" — comparing IoU > 0.1 on a
     499-unit split against IoU >= 0.3 OR overlap > 50% on a 376-unit split.
@@ -638,6 +650,8 @@ def list_baselines() -> list[str]:
 
 
 def _fmt(v: Any) -> str:
+    if v is _ABSENT:
+        return "<absent>"
     return "None" if v is None else repr(v)
 
 
@@ -694,8 +708,20 @@ def compare(a: "Baseline | str", b: "Baseline | str", metric: str = "f1",
                 f"    -> identical split members, different ground truth. The "
                 f"label extraction differs between the two runs.")
 
+    # Gate on inequality itself, then use differences() only to explain it. The
+    # reverse — gating on differences() — makes the refusal only as reliable as the
+    # diff routine, and the docstring promises refusal whenever the criteria are
+    # unequal. Belt and braces: if they are unequal but the diff comes back empty,
+    # still refuse, and say the diff could not localise it.
     crit_diff = a.criterion.differences(b.criterion)
-    if crit_diff:
+    if a.criterion != b.criterion and not crit_diff:
+        problems.append(
+            f"  CRITERION MISMATCH (unlocalised)\n"
+            f"    {a.name}: {a.criterion}\n"
+            f"    {b.name}: {b.criterion}\n"
+            f"    -> the two criteria are not equal, but no differing field could "
+            f"be identified. Treat as incomparable and inspect them by hand.")
+    elif crit_diff:
         problems.append(
             f"  CRITERION MISMATCH\n"
             f"    {a.name}: {a.criterion}\n"

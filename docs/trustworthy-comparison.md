@@ -38,7 +38,9 @@ print(f"Baseline: P=0.860, R=0.636, F1=0.731")
 ```
 
 An **f-string with no interpolation**. It printed identically on every run
-regardless of data, parameters, or split. It sat in eight scripts. It went to
+regardless of data, parameters, or split. Eight scripts carried a hardcoded
+comparator: seven printed that same non-interpolated string, and an eighth fed a
+different constant into a subtraction to produce a delta. It went to
 stdout, stdout went into a job-completion notification, and the notification was
 read back as a measurement — producing the sentence "the CNN still beats the
 baseline" in a single turn with zero files opened.
@@ -87,32 +89,58 @@ the original runner filtered unrecognised keyword arguments out with a
 `co_varnames` comprehension, passing one variant's tuned parameters to the
 other's function *dropped two of them without a word*.
 
-### What the valid comparison actually said
+### What the valid comparison said — and then said again, differently
 
-Re-scored properly — one split, one criterion, both arms — the classical
-detector wins:
+The fifth attempt fixed the protocol: one split, one criterion, both arms scored
+by the same function. On that split the classical detector led:
 
 | Matching criterion | Classical detector | CNN | Δ |
 |---|---|---|---|
 | Validated matcher (IoU ≥ 0.3 **or** overlap ≥ 0.5) | **0.801** @ threshold 0.4 | 0.775 @ threshold 0.2 | −0.026 |
 | IoU ≥ 0.3 only | **0.762** | 0.747 | −0.014 |
 
-**State these caveats wherever you state those numbers:**
+Two caveats were attached to it, both correct:
 
-- **Both arms are oracle-best** — each arm's operating point was chosen by
-  maximising F1 *on the test set*. These are upper bounds, not held-out
-  estimates. (See rule 4.)
+- **Both arms were oracle-best** — each operating point was chosen by maximising
+  F1 *on the test set*. Upper bounds, not held-out estimates. (See rule 4.)
 - **22 of the 30 test files had leaked** into the CNN's training or validation
-  set. Only 8 were genuinely held out for that arm. The CNN's number is
-  therefore inflated — which makes the classical detector's win *stronger*
-  evidence, not weaker, but it is not a clean measurement of either arm.
-- The margins (0.026 and 0.014) are small at this sample size. They are not
-  claimed as significant; they are stated as *the classical baseline was never
-  beaten*, which is the honest form of the finding.
+  set. Only 8 were genuinely held out for that arm.
 
-The publishable result is a negative one: **the classical detector still beats
-the CNN.** That is a real finding, and it took four invalid comparisons to
-reach it.
+A sixth run then fixed both caveats: the model's true held-out 15 files, zero
+leakage, each arm's threshold chosen on a *validation* split. **The direction
+reversed, on both criteria:**
+
+| Matching criterion | Classical detector | CNN | Δ |
+|---|---|---|---|
+| Validated matcher | 0.721 @ 0.7 | **0.859** @ 0.2 | **+0.138** |
+| IoU ≥ 0.3 only | 0.630 | **0.847** | **+0.218** |
+
+The clean margin is five times the size of the leaky one, pointing the other way.
+
+**And the caveat contained a false inference — which is the most instructive part
+of this whole episode.** The leakage note originally read: the CNN's number is
+inflated by leakage, *therefore* removing the leakage makes the classical
+detector's win stronger evidence. That is a plausible confound story, and it was
+wrong. Empirically the CNN scored **higher** on the clean split (0.859) than on
+the leaked one (0.775). Leakage was not inflating it. The reasoning was never
+checked against a measurement — it was asserted because it sounded like the
+conservative direction, which is exactly what **rule 14** warns against, written
+three pages further down the same document.
+
+So the honest finding is not "the classical detector wins." It is:
+
+> On this dataset the comparison was invalid four different ways, a fifth
+> attempt fixed the protocol and favoured the classical detector, and a sixth
+> attempt fixed the remaining confounds and reversed the result. The margin is
+> not stable across splits, and the test sets are small (246–499 annotated units).
+
+If you need a number to quote, quote the sixth: CNN ≈ 0.86 against ≈ 0.72, with
+the threshold chosen on validation and no leakage, on 15 files / 246 units — and
+say that a differently-drawn split gave the opposite sign.
+
+That is a weaker claim than either single run appears to support, and it is the
+only one the evidence carries. **A result that flips when you fix the protocol was
+never a result; it was an artefact with a plausible story attached.**
 
 ---
 
@@ -168,7 +196,9 @@ score threshold of 0.10:
 A **2.1× difference in true positives**, from a constant that did nothing —
 holding the split, the matcher and the score threshold fixed, so the resampling
 is the only difference. Across the scripts that reported on this model, its F1
-appeared as low as 0.457 and as high as 0.766, and every one of those numbers was
+appeared as low as 0.457 and as high as 0.766 — a spread that mixes two
+variables (resampled vs native input, and different confidence thresholds), which
+is itself the point: nothing recorded which was which. Every one of those numbers was
 correctly computed.
 
 > **Rule:** a constant that is declared and never read is not documentation, it
@@ -302,10 +332,11 @@ like* a result. Given time, the output is quoted.
     seed-label agreement of 35.8%, hedges it correctly in its own print
     statement, and then reports a 91% purity figure elsewhere has chosen the
     flattering number. That choice is the misconduct, not the low number.
-12. **Report negative results.** "The classical baseline still beats our model"
-    is a finding. A results file recording zero predictions and F1 = 0.0, and a
-    docstring explaining why an approach was abandoned, are among the most
-    valuable artifacts a project produces.
+12. **Report negative results.** A results file recording zero predictions and
+    F1 = 0.0, and a docstring explaining why an approach was abandoned, are among
+    the most valuable artifacts a project produces. "Our comparison reversed when
+    we fixed the split" is also a finding — and a more useful one than either
+    direction it pointed in.
 13. **Validate the comparison before you calibrate the number.** This is the
     subtle one. A report can be *excellent in form* — recommending a range over
     a point estimate, flagging that 1.7 points at n=30 is within normal
