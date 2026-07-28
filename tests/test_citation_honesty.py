@@ -135,12 +135,44 @@ def test_partial_title_match_cannot_reach_verified(cited_title):
     assert "agree with the record" not in (res.metadata_match.detail or "")
 
 
-def test_warn_band_boundary_is_not_pass():
-    """Directly probe the band edges rather than trusting one fixture."""
-    for sim_target in (0.65, 0.75, 0.84):
-        assert sim_target < TITLE_MATCH_THRESHOLD
-    # The threshold ordering itself is the invariant the fix depends on.
-    assert TITLE_DISTINCT_THRESHOLD < TITLE_MATCH_THRESHOLD
+@pytest.mark.parametrize("cited_title", [
+    "Attention Is All You Need for Machine Translation Tasks",  # ~0.63, band floor
+    "Attention Is All You Need for Speech Recognition",         # ~0.68
+    "Is Attention All You Really Need?",                        # ~0.77, mid-band
+    "Attention Is Really All That You Need",                    # ~0.81
+    "Attention Is All You Need, Revisited",                     # ~0.83, band ceiling
+])
+def test_warn_band_is_never_reported_as_agreement(cited_title):
+    """Sweep several titles across the warn band, not one fixture.
+
+    The previous version of this test asserted `0.65 < TITLE_MATCH_THRESHOLD` —
+    arithmetic on two constants, which passes against an empty module and proves
+    nothing. It was pointed out in review, and it is exactly the failure the rest
+    of this file exists to catch: a check that reports success without testing
+    the behaviour it claims to test.
+
+    Every title here must land strictly inside the band and must NOT be reported
+    as agreement. If a fixture drifts out of the band the test says so rather
+    than passing quietly.
+    """
+    sim = title_similarity(cited_title, "Attention Is All You Need")
+    assert TITLE_DISTINCT_THRESHOLD <= sim < TITLE_MATCH_THRESHOLD, (
+        f"fixture {cited_title!r} scored {sim:.3f}, outside the warn band "
+        f"[{TITLE_DISTINCT_THRESHOLD}, {TITLE_MATCH_THRESHOLD}) — retune it")
+
+    res = verify_reference(
+        Reference(doi="10.5555/attention", title=cited_title,
+                  authors=["Vaswani, Ashish"], year=2017),
+        fetch=_crossref_only())
+
+    assert res.metadata_match.status == "warn", (
+        f"similarity {sim:.3f} reported as {res.metadata_match.status!r}")
+    assert res.verdict != "verified"
+    assert res.score < VERIFIED_SCORE_THRESHOLD
+    detail = res.metadata_match.detail or ""
+    assert "agree with the record" not in detail
+    # The detail must name the mismatch it found, not just flag one.
+    assert cited_title[:12].lower() in detail.lower() or "similarity" in detail.lower()
 
 
 # ---------------------------------------------------------------------------
