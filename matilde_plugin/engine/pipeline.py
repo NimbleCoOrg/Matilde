@@ -26,6 +26,10 @@ from typing import Any, Callable, Dict, List, Optional
 from .store import StudyStore
 
 
+# A step row in one of these states will not be revisited by a later run.
+_TERMINAL_STEP_STATUSES = ("done", "skipped", "failed")
+
+
 @dataclass
 class StepResult:
     """What a step produces. All optional — a step may only record findings."""
@@ -55,8 +59,15 @@ def run(store: StudyStore, study_id: int, steps: List[Step], *,
         resume: bool = True) -> dict:
     """Execute *steps* in order against *study_id*, persisting after each.
 
-    Returns a summary dict: ``{study_id, status, steps: [...], failed_step}``.
+    Returns a summary dict:
+    ``{study_id, status, steps: [...], failed_step, unfinished_steps}``.
     Done steps are skipped when ``resume`` is True (the default).
+
+    Each step's checkpoint (result + artifacts + findings + status) is written in a
+    single transaction, so an interrupted run never leaves persisted findings
+    attached to a step that still looks pending. The study is marked ``done`` only
+    when every step row is terminal; otherwise ``partial``, with the outstanding
+    step names in ``unfinished_steps``.
     """
     store.add_steps(study_id, [s.name for s in steps])
 
@@ -92,25 +103,36 @@ def run(store: StudyStore, study_id: int, steps: List[Step], *,
                     "steps": per_step, "failed_step": failed_step}
 
         result = result or StepResult()
-        store.record_step_result(study_id, step.name, result.data)
-        for art in result.artifacts:
-            store.add_artifact(
-                study_id, step.name,
-                path=art.get("path", ""), kind=art.get("kind", ""),
-                sha256=art.get("sha256", ""), bytes=art.get("bytes"),
-                meta=art.get("meta"))
-        for fnd in result.findings:
-            store.add_finding(
-                study_id, step.name,
-                claim=fnd.get("claim", ""), verdict=fnd.get("verdict", ""),
-                score=fnd.get("score"), evidence=fnd.get("evidence"))
-        store.set_step_status(study_id, step.name, "done")
+        # One transaction for the whole checkpoint. Writing findings and *then*
+        # flipping the status in a separate statement meant a crash in between left
+        # the findings committed against a step still marked pending — so resume
+        # re-ran the step and wrote them a second time (one finding became two).
+        with store.transaction():
+            store.record_step_result(study_id, step.name, result.data)
+            for art in result.artifacts:
+                store.add_artifact(
+                    study_id, step.name,
+                    path=art.get("path", ""), kind=art.get("kind", ""),
+                    sha256=art.get("sha256", ""), bytes=art.get("bytes"),
+                    meta=art.get("meta"))
+            for fnd in result.findings:
+                store.add_finding(
+                    study_id, step.name,
+                    claim=fnd.get("claim", ""), verdict=fnd.get("verdict", ""),
+                    score=fnd.get("score"), evidence=fnd.get("evidence"))
+            store.set_step_status(study_id, step.name, "done")
         prior[step.name] = result.data
         per_step.append({"name": step.name, "status": "done"})
 
-    store.set_study_status(study_id, "done")
-    return {"study_id": study_id, "status": "done",
-            "steps": per_step, "failed_step": None}
+    # "done" is a claim about the whole study, so it requires every step *row* to
+    # be terminal — not merely the steps this call happened to be handed. A study
+    # created with a five-step plan and advanced with three of them is 'partial'.
+    unfinished = [s["name"] for s in store.get_steps(study_id)
+                  if s["status"] not in _TERMINAL_STEP_STATUSES]
+    status = "done" if not unfinished else "partial"
+    store.set_study_status(study_id, status)
+    return {"study_id": study_id, "status": status, "steps": per_step,
+            "failed_step": None, "unfinished_steps": unfinished}
 
 
 def resume(store: StudyStore, study_id: int, steps: List[Step]) -> dict:

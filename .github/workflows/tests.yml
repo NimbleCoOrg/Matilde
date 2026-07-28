@@ -1,0 +1,60 @@
+name: tests
+
+# The offline suite, on every PR. This lane exists because it did not: until
+# 2026-07-27 CI ran only `tests/test_check_sanitization.py` — 154 of the repo's
+# 2,000+ test lines — so the citation engine, the study pipeline and the MEG
+# validation code were never exercised by any automated gate.
+#
+# Two lanes on purpose:
+#   * pr      — offline only, no network, no secrets. Must stay fast and green.
+#   * live    — weekly, hits Crossref/OpenAlex/DataCite for real. These are the
+#               only guard against provider schema drift, and they are skipped by
+#               default, so nothing else would ever notice a breaking API change.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    # Mondays 07:00 UTC — the live-API lane.
+    - cron: "0 7 * * 1"
+  workflow_dispatch:
+
+jobs:
+  offline:
+    name: offline suite
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install deps
+        run: pip install pytest
+
+      - name: Run offline suite
+        run: python -m pytest -q
+
+  live:
+    name: live provider APIs (schema-drift guard)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install deps
+        run: pip install pytest
+
+      - name: Run suite with live provider calls
+        # MATILDE_LIVE un-skips the tests that call Crossref / OpenAlex /
+        # DataCite. MATILDE_CONTACT_EMAIL joins the providers' polite pools.
+        env:
+          MATILDE_LIVE: "1"
+          MATILDE_CONTACT_EMAIL: ${{ secrets.MATILDE_CONTACT_EMAIL }}
+        run: python -m pytest -q

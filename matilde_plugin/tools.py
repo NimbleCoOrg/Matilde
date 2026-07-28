@@ -213,33 +213,66 @@ def _handle_verify_bibliography(args: dict, **kwargs: Any) -> str:
         return _tool_error("'references' must be a non-empty list of citation objects.")
     try:
         from .engine.citations import verify_reference
-        results, summary = [], {}
-        flagged = []
-        for i, item in enumerate(refs):
-            if not isinstance(item, dict):
-                results.append({"index": i, "error": "not an object"})
-                continue
-            ref = _reference_from_args(item)
-            r = verify_reference(ref)
-            summary[r.verdict] = summary.get(r.verdict, 0) + 1
-            if r.verdict in ("not_found", "retracted"):
-                flagged.append({"index": i, "verdict": r.verdict,
-                                "title": ref.title or ref.doi or ref.raw})
-            results.append({
-                "index": i, "verdict": r.verdict, "score": r.score,
-                "title": ref.title or ref.doi, "detail": r.to_dict(),
-            })
-        return _tool_result(
-            count=len(refs),
-            summary=summary,
-            needs_attention=flagged,
-            results=results,
-            message=(f"Verified {len(refs)} references: " +
-                     ", ".join(f"{k}={v}" for k, v in sorted(summary.items())) +
-                     (f". {len(flagged)} need attention." if flagged else ".")),
-        )
     except Exception as exc:
         return _tool_error(f"verify_bibliography failed: {type(exc).__name__}: {exc}")
+
+    results, summary = [], {}
+    flagged = []
+    errors = 0
+    for i, item in enumerate(refs):
+        if not isinstance(item, dict):
+            errors += 1
+            results.append({"index": i, "error": "not an object"})
+            continue
+        ref = _reference_from_args(item)
+        label = ref.title or ref.doi or ref.raw
+        # Per-reference isolation: one transient network error (a 429 on
+        # reference 40 of 50) used to abort the whole run and discard every
+        # verdict already computed. A bibliography audit must be resumable and
+        # must never silently lose work.
+        try:
+            r = verify_reference(ref)
+        except Exception as exc:
+            errors += 1
+            results.append({"index": i, "title": label, "verdict": "error",
+                            "error": f"{type(exc).__name__}: {exc}"})
+            flagged.append({"index": i, "verdict": "error", "title": label,
+                            "reason": f"verification failed: "
+                                      f"{type(exc).__name__}: {exc}"})
+            continue
+        summary[r.verdict] = summary.get(r.verdict, 0) + 1
+        if r.verdict in ("not_found", "retracted"):
+            flagged.append({"index": i, "verdict": r.verdict, "title": label,
+                            "reason": r.verdict})
+        elif r.metadata_match.status == "fail":
+            # The DOI resolves, but to a *different paper*. Materially worse than
+            # a year typo, which also lands on the "warnings" verdict.
+            flagged.append({"index": i, "verdict": r.verdict, "title": label,
+                            "reason": "metadata_mismatch",
+                            "detail": r.metadata_match.detail})
+        results.append({
+            "index": i, "verdict": r.verdict, "score": r.score,
+            "axes_evaluated": r.axes_evaluated,
+            "metadata_match": r.metadata_match.status,
+            "title": ref.title or ref.doi, "detail": r.to_dict(),
+        })
+
+    verified_count = len(refs) - errors
+    message = (f"Verified {verified_count} of {len(refs)} references: " +
+               ", ".join(f"{k}={v}" for k, v in sorted(summary.items())))
+    if errors:
+        message += (f". {errors} reference(s) could not be checked "
+                    f"(see results[].error) — their status is unknown, not clean")
+    message += f". {len(flagged)} need attention." if flagged else "."
+    return _tool_result(
+        count=len(refs),
+        verified=verified_count,
+        errors=errors,
+        summary=summary,
+        needs_attention=flagged,
+        results=results,
+        message=message,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -457,9 +490,18 @@ def _handle_fetch_fulltext(args: dict, **kwargs: Any) -> str:
             payload["message"] = (f"Full text via {res.source} (NOT open access — "
                                   f"verify you have the right to access it): "
                                   f"{res.best_url}")
+        elif res.errors:
+            # Not the same statement as "no open-access copy exists".
+            payload["message"] = (
+                f"Open-access lookup for {res.doi} is INCOMPLETE — "
+                f"{len(res.errors)} provider(s) could not be consulted "
+                f"({'; '.join(res.errors)}). "
+                f"Consulted successfully: {', '.join(res.sources_consulted) or 'none'}. "
+                f"No copy was found, but absence was not established.")
         else:
             payload["message"] = (f"No open-access copy found for {res.doi} "
-                                  f"(status: {res.oa_status}).")
+                                  f"(status: {res.oa_status}; consulted: "
+                                  f"{', '.join(res.sources_consulted) or 'none'}).")
         return _tool_result(payload)
     except Exception as exc:
         return _tool_error(f"fetch_fulltext failed: {type(exc).__name__}: {exc}")
@@ -553,11 +595,28 @@ def _handle_study_create(args: dict, **kwargs: Any) -> str:
             if isinstance(bounds, dict):
                 meta["bounds"] = bounds
         store = _open_store()
+        # create_study is idempotent on slug: an existing study is *reused*, and
+        # the submitted plan/meta are NOT applied. Reporting the submitted plan
+        # back described a study that does not exist.
+        existing = store.get_study_by_slug(slug)
         sid = store.create_study(slug=slug, title=title, plan=plan, meta=meta)
-        store.add_steps(sid, plan)
+        stored = store.get_study(sid) or {}
+        stored_plan = stored.get("plan") or []
+        store.add_steps(sid, stored_plan)
+        if existing is not None:
+            reused_note = ""
+            if stored_plan != plan:
+                reused_note = (f" The submitted plan ({len(plan)} step(s)) was NOT "
+                               f"applied; the stored plan is unchanged.")
+            return _tool_result(
+                study_id=sid, slug=slug, plan=stored_plan, reused=True,
+                submitted_plan=plan,
+                message=(f"Study {sid} ('{slug}') already existed — reusing it "
+                         f"with its stored plan of {len(stored_plan)} step(s)."
+                         + reused_note))
         return _tool_result(
-            study_id=sid, slug=slug, plan=plan,
-            message=f"Created study {sid} ('{slug}') with {len(plan)} step(s).")
+            study_id=sid, slug=slug, plan=stored_plan, reused=False,
+            message=f"Created study {sid} ('{slug}') with {len(stored_plan)} step(s).")
     except Exception as exc:
         return _tool_error(f"study_create failed: {type(exc).__name__}: {exc}")
 

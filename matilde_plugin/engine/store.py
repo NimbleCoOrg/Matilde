@@ -25,6 +25,7 @@ import json
 import os
 import sqlite3
 import time
+from contextlib import contextmanager
 from typing import List, Optional
 
 _SCHEMA = """
@@ -121,6 +122,29 @@ class StudyStore:
         self._conn.execute("PRAGMA journal_mode=WAL;")
         self._conn.execute("PRAGMA foreign_keys=ON;")
         self._conn.executescript(_SCHEMA)
+
+    @contextmanager
+    def transaction(self):
+        """Group several writes into one all-or-nothing unit.
+
+        The connection runs with ``isolation_level=None`` (autocommit), which makes
+        every individual write durable the instant it returns — but also means a
+        sequence of writes has *no* atomicity unless the transaction is opened
+        explicitly. ``BEGIN IMMEDIATE`` takes the write lock up front, so a crash
+        part-way through rolls the whole group back rather than leaving half of it
+        committed.
+
+        Used by the pipeline runner to persist a step's findings and flip its status
+        together: separately, a crash between the two re-ran a "pending" step that
+        had already written its findings, duplicating them on resume.
+        """
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            yield self
+        except BaseException:
+            self._conn.execute("ROLLBACK")
+            raise
+        self._conn.execute("COMMIT")
 
     # ---- studies ---------------------------------------------------------
 

@@ -30,6 +30,9 @@ import dataclasses
 import json
 import os
 import re
+import time
+import unicodedata
+import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
@@ -48,6 +51,40 @@ WAYBACK_API = "https://archive.org/wayback/available"
 
 FetchFn = Callable[..., dict]
 HeadFn = Callable[..., tuple]
+
+# Sources whose records carry retraction information. DataCite (arXiv, Zenodo,
+# figshare, Dryad) publishes none, so a DataCite record can never support a
+# "not retracted" conclusion — see :func:`check_retraction`.
+_RETRACTION_CAPABLE_SOURCES = ("crossref", "openalex")
+
+_SOURCE_LABELS = {"crossref": "Crossref", "openalex": "OpenAlex",
+                  "datacite": "DataCite"}
+
+
+def _source_label(source: str) -> str:
+    """Human name for a provenance key. Never invents a name we didn't record."""
+    return _SOURCE_LABELS.get(source, source or "an unidentified source")
+
+
+def _fetch_json(url: str, fetch: FetchFn) -> tuple:
+    """Fetch *url*, distinguishing "absent" from "could not be consulted".
+
+    Returns ``(data, error)``:
+
+      * ``(dict, None)``  — the source answered.
+      * ``(None, None)``  — a clean 404: the record genuinely is not there.
+      * ``(None, "TypeError: …")`` — DNS/TLS/timeout/5xx. The source was *not*
+        consulted, and callers must not report its silence as evidence.
+
+    Conflating the last two is how a network outage turns into a scientific claim.
+    """
+    try:
+        data = fetch(url)
+    except LookupError:
+        return (None, None)
+    except Exception as exc:  # transport/parse failure — NOT an absence of data
+        return (None, f"{type(exc).__name__}: {exc}")
+    return (data, None)
 
 
 # ---------------------------------------------------------------------------
@@ -98,6 +135,9 @@ class VerificationResult:
     url_liveness: AxisResult
     score: float = 0.0          # composite verifiability [0..1]
     verdict: str = "unverifiable"  # verified | warnings | retracted | not_found | unverifiable
+    # Which axes actually ran — i.e. the denominator the score is averaged over.
+    # Without it, a score cannot be read: 1.0 over two axes is not 1.0 over four.
+    axes_evaluated: list = field(default_factory=list)
 
     def to_dict(self) -> dict:
         """A JSON-safe dict (for tool envelopes / persistence)."""
@@ -117,9 +157,52 @@ def _normalize_doi(doi: str) -> str:
     return doi.strip()
 
 
+# Letters that carry no Unicode decomposition, so NFKD leaves them intact and a
+# naive [^a-z0-9] scrub *deletes* them mid-word ("Łukasiewicz" -> "ukasiewicz").
+# Folding them explicitly is what keeps author matching working for names outside
+# the English alphabet. Mapping is one-way and for comparison only — the stored
+# citation always keeps the author's own spelling.
+_FOLD_SPECIALS = {
+    "ł": "l", "Ł": "L", "ø": "o", "Ø": "O", "đ": "d", "Đ": "D",
+    "ð": "d", "Ð": "D", "þ": "th", "Þ": "Th", "ħ": "h", "Ħ": "H",
+    "ŧ": "t", "Ŧ": "T", "ı": "i", "İ": "I", "ŀ": "l", "Ŀ": "L",
+    "ß": "ss", "ẞ": "SS", "æ": "ae", "Æ": "AE", "œ": "oe", "Œ": "OE",
+    "ŋ": "ng", "Ŋ": "NG", "ə": "e", "Ə": "E", "ʼ": "'", "’": "'",
+}
+
+
+def ascii_fold(s: str) -> str:
+    """Fold *s* toward ASCII for comparison: strip combining marks, map specials.
+
+    ``unicodedata.normalize("NFKD", …)`` splits a precomposed letter into base +
+    combining mark, which we then drop — so "Müller" folds to "Muller" and
+    "Zhāng" to "Zhang". Letters that have *no* decomposition (ł, ø, ß, æ, đ, ı)
+    are mapped explicitly by :data:`_FOLD_SPECIALS`.
+
+    This is a *comparison* helper only. It is deliberately never applied to the
+    reference or record text we display or persist: a citation must keep the
+    author's own orthography. Folding here, and only here, is what lets
+    "Łukasiewicz" match "Lukasiewicz" without ever rewriting either one.
+    """
+    if not s:
+        return ""
+    out = []
+    for ch in unicodedata.normalize("NFKD", s):
+        if unicodedata.combining(ch):
+            continue  # a stripped accent, not a letter
+        out.append(_FOLD_SPECIALS.get(ch, ch))
+    return "".join(out)
+
+
 def _norm_title(s: str) -> str:
-    s = s.lower()
-    s = re.sub(r"[^a-z0-9]+", " ", s)
+    """Casefold + ASCII-fold *s* and reduce every non-alphanumeric run to a space.
+
+    ``str.isalnum()`` (rather than an ``[a-z0-9]`` class) keeps letters and digits
+    from *any* script, so a Cyrillic, Greek, or CJK title is normalized rather
+    than erased.
+    """
+    s = ascii_fold(s).lower()
+    s = "".join(ch if ch.isalnum() else " " for ch in s)
     return " ".join(s.split())
 
 
@@ -170,6 +253,17 @@ def author_overlap(ref_authors: list, record_authors: list) -> float:
 def _record_title(message: dict) -> str:
     t = message.get("title") or []
     return t[0] if isinstance(t, list) and t else (t if isinstance(t, str) else "")
+
+
+def _crossref_record(message: dict) -> dict:
+    """Tag a Crossref ``message`` with its provenance, without mutating the input.
+
+    Every record the engine passes around carries ``_source``, so downstream axes
+    can tell *where* a field came from rather than assuming Crossref.
+    """
+    if not isinstance(message, dict):
+        return {"_source": "crossref"}
+    return dict(message, _source="crossref")
 
 
 def _openalex_to_record(work: dict) -> dict:
@@ -246,7 +340,7 @@ def verify_existence(ref: Reference, fetch: FetchFn) -> AxisResult:
         url = f"{CROSSREF_BASE}/works/{urllib.parse.quote(ref.doi)}"
         try:
             data = fetch(url)
-            message = data.get("message", data)
+            message = _crossref_record(data.get("message", data))
             return AxisResult(
                 status="pass", confidence=0.95,
                 detail=f"DOI {ref.doi} resolves to a Crossref record.",
@@ -295,7 +389,8 @@ def verify_existence(ref: Reference, fetch: FetchFn) -> AxisResult:
             return AxisResult(
                 status="pass", confidence=best_sim,
                 detail=f"Title matched a Crossref record (similarity {best_sim:.2f}).",
-                evidence={"record": best, "matched_by": "title", "similarity": best_sim},
+                evidence={"record": _crossref_record(best), "matched_by": "title",
+                          "source": "crossref", "similarity": best_sim},
             )
         return AxisResult(
             status="unknown", confidence=0.4,
@@ -343,39 +438,109 @@ def _datacite_by_doi(doi: str, fetch: FetchFn) -> Optional[dict]:
 # ---------------------------------------------------------------------------
 
 def check_metadata_match(ref: Reference, record: dict) -> AxisResult:
-    """Do the citation's title/authors/year agree with the authoritative record?"""
+    """Do the citation's title/authors/year agree with the authoritative record?
+
+    Only the sub-axes that *could* be compared are evaluated, and the detail names
+    them. An absent field is never scored as agreement: a reference carrying a DOI
+    and nothing else has nothing to corroborate the DOI with, so this returns
+    ``unknown`` rather than ``pass``. ``evidence["axes_evaluated"]`` lists exactly
+    which sub-axes ran, so a reader can see what the status is based on.
+
+    Title outcomes are banded, because a title that is *close but not equal* is the
+    signature of a fabricated reference (a hallucinated citation characteristically
+    gets the DOI right and the title subtly wrong):
+
+      * ``sim >= TITLE_MATCH_THRESHOLD``      — titles agree
+      * ``TITLE_DISTINCT_THRESHOLD <= sim <`` — **warn**, and both titles are named
+        ``TITLE_MATCH_THRESHOLD``               so the caller can eyeball the drift
+      * ``sim < TITLE_DISTINCT_THRESHOLD``    — **fail**, a different paper
+    """
     if not record:
         return AxisResult(status="unknown", detail="No record to compare against.")
 
     rec_title = _record_title(record)
-    sim = title_similarity(ref.title, rec_title) if ref.title else 1.0
-    if ref.title and sim < TITLE_DISTINCT_THRESHOLD:
+    rec_year = _record_year(record)
+    rec_authors = record.get("author", []) or []
+
+    axes_evaluated: list = []
+    evidence: dict = {"record_title": rec_title, "axes_evaluated": axes_evaluated}
+    warnings: list = []
+    not_compared: list = []
+
+    # --- title ---
+    sim = None
+    if ref.title and rec_title:
+        sim = title_similarity(ref.title, rec_title)
+        axes_evaluated.append("title")
+        evidence["title_similarity"] = sim
+        if sim < TITLE_DISTINCT_THRESHOLD:
+            return AxisResult(
+                status="fail", confidence=1.0 - sim,
+                detail=f"Title disagrees with the record (similarity {sim:.2f}): "
+                       f"cited '{ref.title}' vs record '{rec_title}'.",
+                evidence=evidence,
+            )
+        if sim < TITLE_MATCH_THRESHOLD:
+            # The dangerous middle band. Previously this returned "pass" with the
+            # detail "Title, authors, and year agree with the record." — the exact
+            # shape of a hallucinated reference sailing through.
+            warnings.append(
+                f"title only partially matches (similarity {sim:.2f}, below the "
+                f"{TITLE_MATCH_THRESHOLD:.2f} match threshold): cited "
+                f"'{ref.title}' vs record '{rec_title}'"
+            )
+    elif ref.title and not rec_title:
+        not_compared.append("title (the record carries no title)")
+    else:
+        not_compared.append("title (not supplied in the citation)")
+
+    # --- year ---
+    if ref.year and rec_year:
+        axes_evaluated.append("year")
+        evidence["record_year"] = rec_year
+        if ref.year != rec_year:
+            warnings.append(f"year mismatch (cited {ref.year}, record {rec_year})")
+    elif ref.year and not rec_year:
+        not_compared.append("year (the record carries no year)")
+    else:
+        not_compared.append("year (not supplied in the citation)")
+
+    # --- authors ---
+    if ref.authors and rec_authors:
+        overlap = author_overlap(ref.authors, rec_authors)
+        axes_evaluated.append("authors")
+        evidence["author_overlap"] = overlap
+        if overlap < 0.5:
+            warnings.append(f"author overlap low ({overlap:.0%})")
+    elif ref.authors and not rec_authors:
+        not_compared.append("authors (the record lists none)")
+    else:
+        not_compared.append("authors (not supplied in the citation)")
+
+    evidence["not_compared"] = not_compared
+
+    # Neither of the two identifying axes ran: there is nothing corroborating the
+    # citation, and saying "metadata agrees" would be a claim about a check that
+    # never happened.
+    if "title" not in axes_evaluated and "authors" not in axes_evaluated:
         return AxisResult(
-            status="fail", confidence=1.0 - sim,
-            detail=f"Title disagrees with the record (similarity {sim:.2f}): "
-                   f"cited '{ref.title}' vs record '{rec_title}'.",
-            evidence={"title_similarity": sim, "record_title": rec_title},
+            status="unknown", confidence=0.0,
+            detail="Nothing to compare: neither title nor authors were available "
+                   "on both sides (" + "; ".join(not_compared) + "). "
+                   "Existence is corroborated, metadata is not.",
+            evidence=evidence,
         )
 
-    warnings = []
-    evidence: dict = {"title_similarity": sim, "record_title": rec_title}
-
-    rec_year = _record_year(record)
-    if ref.year and rec_year and ref.year != rec_year:
-        warnings.append(f"year mismatch (cited {ref.year}, record {rec_year})")
-        evidence["record_year"] = rec_year
-
-    overlap = author_overlap(ref.authors, record.get("author", []))
-    evidence["author_overlap"] = overlap
-    if ref.authors and overlap < 0.5:
-        warnings.append(f"author overlap low ({overlap:.0%})")
-
+    compared = ", ".join(axes_evaluated)
     if warnings:
         return AxisResult(status="warn", confidence=0.6,
-                          detail="; ".join(warnings) + ".", evidence=evidence)
-    return AxisResult(status="pass", confidence=max(sim, 0.8),
-                      detail="Title, authors, and year agree with the record.",
-                      evidence=evidence)
+                          detail="; ".join(warnings) + f". (Compared: {compared}.)",
+                          evidence=evidence)
+    return AxisResult(
+        status="pass", confidence=max(sim if sim is not None else 0.8, 0.8),
+        detail=f"Agrees with the record on {compared}."
+               + (f" Not compared: {'; '.join(not_compared)}." if not_compared else ""),
+        evidence=evidence)
 
 
 # ---------------------------------------------------------------------------
@@ -409,52 +574,167 @@ def _retraction_signal(message: dict) -> Optional[str]:
     return None
 
 
-def check_retraction(doi: str, fetch: FetchFn) -> AxisResult:
-    """Has the work with *doi* been retracted? ('fail' == retracted.)"""
+def check_retraction(doi: str, fetch: FetchFn,
+                     record: Optional[dict] = None) -> AxisResult:
+    """Has the work with *doi* been retracted? ('fail' == retracted.)
+
+    Consults **every** source that publishes retraction data and can be reached:
+    Crossref (which ingests the Retraction Watch dataset) and OpenAlex (whose
+    ``is_retracted`` flag is independent, and is sometimes the only place a
+    retraction shows up). A false *negative* is the worst error this tool can make,
+    so both are checked even when the first one comes back clean.
+
+    Two honesty rules, both of which this function used to break:
+
+    1. A ``pass`` is only ever returned for a source we actually parsed, and the
+       detail names those sources. A record from DataCite (arXiv/Zenodo/figshare)
+       carries no retraction-capable fields at all, so it can only ever yield
+       ``unknown`` — never "No retraction recorded in Crossref", which would be
+       inventing provenance for a request that was never made.
+    2. A source that could not be *reached* (DNS, TLS, timeout, 5xx) is reported as
+       unreachable, not silently folded into "no retraction found".
+
+    *record*, when given, is an already-fetched existence record; it is reused
+    instead of re-requesting, but only if its ``_source`` publishes retractions.
+    """
     doi = _normalize_doi(doi)
-    if not doi:
-        return AxisResult(status="unknown", detail="No DOI — cannot check retraction.")
-    url = f"{CROSSREF_BASE}/works/{urllib.parse.quote(doi)}"
-    try:
-        data = fetch(url)
-    except LookupError:
-        return AxisResult(status="unknown", confidence=0.3,
-                          detail="DOI not found in Crossref; retraction status unknown.")
-    message = data.get("message", data)
-    label = _retraction_signal(message)
-    if label:
-        return AxisResult(status="fail", confidence=0.95,
-                          detail=f"Work is RETRACTED ({label}).",
-                          evidence={"signal": label})
-    return AxisResult(status="pass", confidence=0.9,
-                      detail="No retraction recorded in Crossref.")
+    consulted: list = []
+    unreachable: list = []
+
+    def _retracted(label: str, src: str) -> AxisResult:
+        return AxisResult(
+            status="fail", confidence=0.95,
+            detail=f"Work is RETRACTED ({label}), per {_source_label(src)}.",
+            evidence={"signal": label, "sources_consulted": [src]})
+
+    # 1. Reuse a record we already hold — only if that source records retractions.
+    record_source = (record or {}).get("_source") or ""
+    if record and record_source in _RETRACTION_CAPABLE_SOURCES:
+        label = _retraction_signal(record)
+        if label:
+            return _retracted(label, record_source)
+        consulted.append(record_source)
+
+    if doi:
+        # 2. Crossref — the Retraction Watch dataset.
+        if "crossref" not in consulted:
+            data, err = _fetch_json(
+                f"{CROSSREF_BASE}/works/{urllib.parse.quote(doi)}", fetch)
+            if err:
+                unreachable.append(f"Crossref ({err})")
+            elif isinstance(data, dict) and data:
+                message = data.get("message", data)
+                label = _retraction_signal(message)
+                if label:
+                    return _retracted(label, "crossref")
+                consulted.append("crossref")
+
+        # 3. OpenAlex `is_retracted` — an independent signal, and the one a
+        #    Crossref-only check misses entirely.
+        if "openalex" not in consulted:
+            work, err = _fetch_json(
+                f"{OPENALEX_BASE}/works/doi:{urllib.parse.quote(doi)}", fetch)
+            if err:
+                unreachable.append(f"OpenAlex ({err})")
+            elif isinstance(work, dict) and work:
+                label = _retraction_signal(_openalex_to_record(work))
+                if label:
+                    return _retracted(label, "openalex")
+                consulted.append("openalex")
+
+    evidence = {"sources_consulted": list(consulted),
+                "sources_unreachable": list(unreachable)}
+
+    if not consulted:
+        why: list = []
+        if not doi:
+            why.append("no DOI was supplied")
+        if record_source and record_source not in _RETRACTION_CAPABLE_SOURCES:
+            why.append(f"the existence record came from "
+                       f"{_source_label(record_source)}, which publishes no "
+                       f"retraction fields")
+        if unreachable:
+            why.append("could not reach " + "; ".join(unreachable))
+        elif doi:
+            why.append(f"{doi} is in neither Crossref nor OpenAlex")
+        return AxisResult(
+            status="unknown", confidence=0.3,
+            detail="Retraction status UNKNOWN — " + "; ".join(why) + ".",
+            evidence=evidence)
+
+    names = " and ".join(_source_label(s) for s in consulted)
+    detail = f"No retraction recorded in {names}."
+    if unreachable:
+        detail += " Not consulted (unreachable): " + "; ".join(unreachable) + "."
+    return AxisResult(status="pass",
+                      confidence=0.95 if len(consulted) > 1 else 0.9,
+                      detail=detail, evidence=evidence)
 
 
 # ---------------------------------------------------------------------------
 # Axis 3b: URL liveness
 # ---------------------------------------------------------------------------
 
+def _unpack_head(result: Any) -> tuple:
+    """Normalize a head callable's return to ``(status, final_url, transport_error)``.
+
+    Accepts both the two-tuple ``(status, final_url)`` shape and the three-tuple
+    ``(status, final_url, transport_error)`` shape, so injected fakes written
+    against the older contract keep working.
+    """
+    if not isinstance(result, (tuple, list)):
+        return (None, "", None)
+    status = result[0] if len(result) > 0 else None
+    final = result[1] if len(result) > 1 else ""
+    error = result[2] if len(result) > 2 else None
+    return (status, final, error)
+
+
+def _wayback_snapshot(url: str, fetch: Optional[FetchFn]) -> tuple:
+    """Return ``(archived_url_or_None, error_or_None)`` for *url*."""
+    if fetch is None:
+        return (None, None)
+    data, err = _fetch_json(f"{WAYBACK_API}?url={urllib.parse.quote(url)}", fetch)
+    if err or not isinstance(data, dict):
+        return (None, err)
+    snap = (data.get("archived_snapshots", {}) or {}).get("closest", {}) or {}
+    return (snap.get("url") if snap.get("available") else None, None)
+
+
 def check_url_liveness(url: str, http_head: HeadFn,
                        fetch: Optional[FetchFn] = None) -> AxisResult:
-    """Does *url* resolve? Dead URLs fall back to an Internet Archive check."""
+    """Does *url* resolve? Dead URLs fall back to an Internet Archive check.
+
+    A **transport failure** (DNS failure, TLS error, connection reset, timeout) is
+    reported as ``unknown`` and names the exception — it is not evidence that the
+    link is dead. Only an actual HTTP response can support ``fail``. The old code
+    collapsed both into ``fail`` with the detail "URL does not resolve (HTTP None)",
+    which asserted a dead link on the strength of our own network trouble.
+    """
     if not url:
         return AxisResult(status="unknown", detail="No URL supplied.")
-    status, final = http_head(url)
+    status, final, transport_error = _unpack_head(http_head(url))
+
     if status is not None and 200 <= status < 400:
         return AxisResult(status="pass", confidence=0.9,
                           detail=f"URL is live (HTTP {status}).",
                           evidence={"http_status": status, "final_url": final})
 
-    # Dead or unreachable — check the Wayback Machine for an archived snapshot.
-    archived = None
-    if fetch is not None:
-        try:
-            data = fetch(f"{WAYBACK_API}?url={urllib.parse.quote(url)}")
-            snap = (data.get("archived_snapshots", {}) or {}).get("closest", {})
-            if snap.get("available"):
-                archived = snap.get("url")
-        except LookupError:
-            archived = None
+    archived, _archive_err = _wayback_snapshot(url, fetch)
+
+    # No HTTP status at all: we never reached the host, so we know nothing about
+    # the link itself.
+    if status is None:
+        reason = transport_error or "no HTTP response was obtained"
+        evidence: dict = {"http_status": None, "transport_error": transport_error}
+        detail = (f"URL liveness UNKNOWN — the request itself failed ({reason}). "
+                  f"This is a transport failure on our side, not evidence that the "
+                  f"link is dead.")
+        if archived:
+            evidence["wayback_url"] = archived
+            detail += " A Wayback Machine snapshot does exist."
+        return AxisResult(status="unknown", confidence=0.2, detail=detail,
+                          evidence=evidence)
 
     if archived:
         return AxisResult(status="warn", confidence=0.6,
@@ -470,17 +750,89 @@ def check_url_liveness(url: str, http_head: HeadFn,
 # Orchestration
 # ---------------------------------------------------------------------------
 
-def _axis_weight(result: AxisResult, weights: dict) -> float:
-    return weights.get(result.status, 0.0)
+# Relative weight of each axis in the composite score.
+_AXIS_WEIGHTS = {"existence": 0.5, "metadata_match": 0.3,
+                 "retraction": 0.1, "url_liveness": 0.1}
+# How much of an axis's weight a given status earns. "unknown" is absent on
+# purpose: an axis that did not run is dropped from the average entirely rather
+# than being handed partial credit.
+_STATUS_QUALITY = {"pass": 1.0, "warn": 0.6, "fail": 0.0}
+
+# A composite at or above this is called "verified" — but only if no axis warned
+# or failed (see :func:`verify_reference`).
+VERIFIED_SCORE_THRESHOLD = 0.8
+
+# The score is the number downstream filters compare against a threshold, so it
+# must never contradict the verdict. Each non-"verified" verdict caps the
+# composite, which preserves the ordering
+#     retracted / not_found  <  unverifiable  <  warnings  <  verified
+# and enforces the invariant
+#     score >= VERIFIED_SCORE_THRESHOLD  <=>  verdict == "verified".
+# Without the cap, a subtly-wrong title scored 0.867 and a bare DOI with nothing
+# to corroborate it scored 1.00 — both "warnings"/"unverifiable" on paper while
+# reading as high confidence to anything that looked at the number.
+_VERDICT_SCORE_CAP = {
+    "retracted": 0.1,
+    "not_found": 0.1,
+    "unverifiable": 0.4,
+    "warnings": round(VERIFIED_SCORE_THRESHOLD - 0.01, 2),
+}
+
+# Ceiling for a reference where an axis was *attempted and came back
+# indeterminate* — as opposed to an axis that never applied. Dropping "unknown"
+# axes from the average (see :func:`_composite_score`) is right, but on its own it
+# lets "we tried to reach the URL and could not" score a flawless 1.0, identical to
+# "we fetched the URL and it was live". A check we attempted and could not complete
+# is not the same as a check that was never needed, and the number must show it.
+_INDETERMINATE_SCORE_CAP = 0.95
+
+
+def _composite_score(axes: dict) -> tuple:
+    """Weighted mean over the axes that actually ran → ``(score, axes_evaluated)``.
+
+    An axis whose status is ``unknown`` contributes to *neither* the numerator nor
+    the denominator, so the score reads as "of what could be checked, how much
+    checked out" — and ``axes_evaluated`` states what that denominator was. The old
+    scheme gave ``unknown`` axes a positive weight, which let a reference with no
+    title, no authors and no URL reach 0.90 on the strength of checks that never
+    ran.
+    """
+    numerator = denominator = 0.0
+    evaluated: list = []
+    for name, result in axes.items():
+        quality = _STATUS_QUALITY.get(result.status)
+        if quality is None:
+            continue  # "unknown" — not evidence in either direction
+        weight = _AXIS_WEIGHTS[name]
+        numerator += weight * quality
+        denominator += weight
+        evaluated.append(name)
+    if denominator == 0.0:
+        return (0.0, evaluated)
+    return (round(numerator / denominator, 3), evaluated)
 
 
 def verify_reference(ref: Reference, fetch: Optional[FetchFn] = None,
                      http_head: Optional[HeadFn] = None) -> VerificationResult:
     """Run all v1 axes and produce a composite verdict + score.
 
-    Verdict precedence: a retraction dominates everything; a non-resolving DOI
-    means ``not_found``; otherwise the score combines existence, metadata-match,
-    and URL liveness.
+    Verdict precedence:
+
+      * ``retracted``     — a retraction dominates everything else.
+      * ``not_found``     — the DOI/title resolves nowhere.
+      * ``unverifiable``  — existence could not be established, **or** nothing
+        corroborates it (a bare DOI with no title and no authors).
+      * ``warnings``      — it exists, but an axis warned or failed: a partial
+        title match, a year or author mismatch, a dead URL, or a retraction status
+        we could not establish. Any of these blocks ``verified`` outright,
+        regardless of score — "something is off" is not a matter of degree.
+      * ``verified``      — every axis that ran passed, and the composite clears
+        :data:`VERIFIED_SCORE_THRESHOLD`.
+
+    ``score`` is a weighted mean over the axes that ran (``result.axes_evaluated``
+    lists them), then capped by the verdict per :data:`_VERDICT_SCORE_CAP` so the
+    two can never disagree: anything short of ``verified`` also scores short of
+    :data:`VERIFIED_SCORE_THRESHOLD`.
     """
     fetch = fetch or default_fetch
     http_head = http_head or default_head
@@ -493,42 +845,50 @@ def verify_reference(ref: Reference, fetch: Optional[FetchFn] = None,
     else:
         metadata = AxisResult(status="unknown", detail="No record to compare against.")
 
-    # Reuse the already-fetched record for retraction when we have it.
-    if record is not None:
-        label = _retraction_signal(record)
-        if label:
-            retraction = AxisResult(status="fail", confidence=0.95,
-                                    detail=f"Work is RETRACTED ({label}).",
-                                    evidence={"signal": label})
-        else:
-            retraction = AxisResult(status="pass", confidence=0.9,
-                                    detail="No retraction recorded in Crossref.")
-    else:
-        doi = ref.doi or ""
-        retraction = check_retraction(doi, fetch=fetch) if doi else \
-            AxisResult(status="unknown", detail="No DOI — cannot check retraction.")
+    # Reuses the already-fetched record when that record's source publishes
+    # retraction data, and always cross-checks the source it has not seen.
+    retraction = check_retraction(ref.doi or "", fetch=fetch, record=record)
 
     url_liveness = check_url_liveness(ref.url, http_head=http_head, fetch=fetch) \
         if ref.url else AxisResult(status="unknown", detail="No URL supplied.")
 
-    # --- Verdict + score ---
+    score, axes_evaluated = _composite_score({
+        "existence": existence,
+        "metadata_match": metadata,
+        "retraction": retraction,
+        "url_liveness": url_liveness,
+    })
+
+    # --- Verdict ---
     if retraction.status == "fail":
-        verdict, score = "retracted", 0.1
+        verdict = "retracted"
     elif existence.status == "fail":
-        verdict, score = "not_found", 0.1
+        verdict = "not_found"
     elif existence.status == "unknown":
-        verdict, score = "unverifiable", 0.4
+        verdict = "unverifiable"
+    elif metadata.status == "unknown":
+        # Existence is corroborated but nothing corroborates the citation itself.
+        verdict = "unverifiable"
+    elif any(axis.status in ("warn", "fail")
+             for axis in (metadata, retraction, url_liveness)):
+        verdict = "warnings"
+    elif retraction.status == "unknown":
+        # We could not establish that it has NOT been retracted; "verified" would
+        # be claiming a check we did not manage to make.
+        verdict = "warnings"
+    elif score >= VERIFIED_SCORE_THRESHOLD:
+        verdict = "verified"
     else:
-        ex = 0.5  # existence passed
-        meta = _axis_weight(metadata, {"pass": 0.3, "warn": 0.18, "unknown": 0.15, "fail": 0.0})
-        live = _axis_weight(url_liveness, {"pass": 0.2, "warn": 0.12, "unknown": 0.1, "fail": 0.0})
-        score = round(ex + meta + live, 3)
-        if metadata.status == "fail":
-            verdict = "warnings"
-        elif score >= 0.8:
-            verdict = "verified"
-        else:
-            verdict = "warnings"
+        verdict = "warnings"
+
+    score = min(score, _VERDICT_SCORE_CAP.get(verdict, 1.0))
+
+    # A URL was cited but we never reached the host: the axis is "unknown" and so
+    # was dropped from the average, which would otherwise let this score a perfect
+    # 1.0 — indistinguishable from a reference whose URL we fetched and confirmed
+    # live. Cap it so the number cannot claim a completeness it does not have.
+    if ref.url and url_liveness.status == "unknown":
+        score = min(score, _INDETERMINATE_SCORE_CAP)
 
     return VerificationResult(
         reference=ref,
@@ -538,6 +898,7 @@ def verify_reference(ref: Reference, fetch: Optional[FetchFn] = None,
         url_liveness=url_liveness,
         score=score,
         verdict=verdict,
+        axes_evaluated=axes_evaluated,
     )
 
 
@@ -551,32 +912,93 @@ def _user_agent() -> str:
     return f"{base} mailto:{contact}" if contact else base
 
 
-def default_fetch(url: str, timeout: float = 20.0) -> dict:
-    """GET *url* and parse JSON. Raises ``LookupError`` on HTTP 404."""
+# HTTP statuses that mean "ask again shortly", not "no". Crossref and OpenAlex
+# both rate-limit with 429, and both return 503 under load.
+RETRYABLE_STATUSES = (429, 500, 502, 503, 504)
+DEFAULT_RETRIES = 3
+RETRY_BASE_DELAY = 1.0
+
+
+def _retry_after_seconds(exc: Any, attempt: int) -> float:
+    """Seconds to wait before retry *attempt*, honouring a ``Retry-After`` header.
+
+    Providers tell us how long to back off; ignoring that header is how a polite
+    client becomes an impolite one. Falls back to exponential backoff.
+    """
+    header = ""
+    try:
+        header = (exc.headers or {}).get("Retry-After", "") or ""
+    except Exception:
+        header = ""
+    try:
+        wait = float(str(header).strip())
+        if wait >= 0:
+            return min(wait, 60.0)
+    except (TypeError, ValueError):
+        pass
+    return RETRY_BASE_DELAY * (2 ** attempt)
+
+
+def default_fetch(url: str, timeout: float = 20.0, *,
+                  retries: int = DEFAULT_RETRIES,
+                  sleep: Callable[[float], Any] = time.sleep) -> dict:
+    """GET *url* and parse JSON. Raises ``LookupError`` on HTTP 404.
+
+    Retries with backoff on the transient statuses in
+    :data:`RETRYABLE_STATUSES` (a 429 from Crossref is a request to slow down, not
+    an answer). A 404 is a real answer and is never retried. *sleep* is injected so
+    tests can exercise the backoff without waiting.
+    """
     req = urllib.request.Request(url, headers={"User-Agent": _user_agent(),
                                                "Accept": "application/json"})
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:  # type: ignore[attr-defined]
-        if exc.code == 404:
-            raise LookupError(url) from exc
-        raise
+    attempts = max(1, int(retries))
+    last_exc: Optional[BaseException] = None
+    for attempt in range(attempts):
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404:
+                raise LookupError(url) from exc
+            last_exc = exc
+            if exc.code in RETRYABLE_STATUSES and attempt < attempts - 1:
+                sleep(_retry_after_seconds(exc, attempt))
+                continue
+            raise
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            # Transport-level: also worth one more try, but never swallowed.
+            last_exc = exc
+            if attempt < attempts - 1:
+                sleep(RETRY_BASE_DELAY * (2 ** attempt))
+                continue
+            raise
+    if last_exc is not None:  # pragma: no cover - loop always returns or raises
+        raise last_exc
+    raise RuntimeError(f"default_fetch exhausted retries for {url}")
 
 
 def default_head(url: str, timeout: float = 15.0) -> tuple:
-    """HEAD *url*; return ``(status, final_url)``. Falls back to GET if HEAD is
-    rejected. Returns ``(None, url)`` if the host is unreachable."""
+    """HEAD *url*; return ``(status, final_url, transport_error)``.
+
+    Falls back to GET if HEAD is rejected. The third element is ``None`` on any
+    real HTTP exchange and a ``"ExcType: message"`` string when the request never
+    got that far (DNS failure, TLS error, reset, timeout) — the caller must be able
+    to tell "the server said 404" from "we never reached a server". Returning a
+    bare ``(None, url)`` for both is what produced the output string
+    "URL does not resolve (HTTP None)".
+    """
+    error: Optional[str] = None
     for method in ("HEAD", "GET"):
         req = urllib.request.Request(url, method=method,
                                      headers={"User-Agent": _user_agent()})
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
-                return (resp.status, resp.geturl())
-        except urllib.error.HTTPError as exc:  # type: ignore[attr-defined]
+                return (resp.status, resp.geturl(), None)
+        except urllib.error.HTTPError as exc:
             if method == "HEAD" and exc.code in (403, 405, 501):
                 continue  # some servers reject HEAD; retry with GET
-            return (exc.code, url)
-        except Exception:
-            return (None, url)
-    return (None, url)
+            return (exc.code, url, None)
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            return (None, url, error)
+    return (None, url, error)

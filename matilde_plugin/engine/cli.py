@@ -9,8 +9,9 @@ Usage::
     python3 -m matilde_plugin.engine.cli refs.bib --email you@example.org   # polite-pool contact
 
 Exit codes: 0 = all references verified / only warnings; 1 = at least one
-``not_found`` or ``retracted`` reference (useful as a pre-commit / CI gate on a
-manuscript's .bib); 2 = usage error.
+reference that needs attention — ``not_found``, ``retracted``, or a metadata-axis
+``fail`` (the DOI resolves to a different paper) — useful as a pre-commit / CI
+gate on a manuscript's .bib; 2 = usage error.
 """
 from __future__ import annotations
 
@@ -50,15 +51,22 @@ def _format_text(results: list) -> str:
         mark = _VERDICT_MARK.get(r.verdict, "   ")
         lines.append(f"  [{mark}] {r.verdict:<12} {r.score:>4}  {label}")
         if r.verdict in ("not_found", "retracted"):
-            flagged.append((i, r.verdict, label))
+            flagged.append((i, r.verdict, label, ""))
+        elif getattr(r, "metadata_match", None) is not None \
+                and r.metadata_match.status == "fail":
+            # A DOI that resolves to a *different paper* is not the same class of
+            # problem as a year typo, though both are verdict 'warnings'.
+            flagged.append((i, r.verdict, label,
+                            f"metadata mismatch — {r.metadata_match.detail}"))
     header = f"Verified {len(results)} reference(s):"
     tally = "  ".join(f"{k}={v}" for k, v in sorted(summary.items()))
     out = [header, *lines, "", tally]
     if flagged:
         out.append("")
         out.append("Needs attention:")
-        for i, verdict, label in flagged:
-            out.append(f"  - #{i} [{verdict}] {label}")
+        for i, verdict, label, note in flagged:
+            out.append(f"  - #{i} [{verdict}] {label}"
+                       + (f"\n      {note}" if note else ""))
     return "\n".join(out)
 
 
@@ -73,8 +81,22 @@ def _format_json(results: list) -> str:
     }, default=str, indent=2)
 
 
+def _needs_attention(r) -> bool:
+    """Is *r* a finding a manuscript gate must not let through?
+
+    ``not_found`` and ``retracted``, plus a metadata-axis ``fail`` — a DOI that
+    resolves to an entirely different paper. That last one lands on the verdict
+    ``warnings``, the same bucket as a one-digit year typo, so gating on the
+    verdict alone let it pass.
+    """
+    if r.verdict in ("not_found", "retracted"):
+        return True
+    metadata = getattr(r, "metadata_match", None)
+    return metadata is not None and metadata.status == "fail"
+
+
 def _exit_code(results: list) -> int:
-    return 1 if any(r.verdict in ("not_found", "retracted") for r in results) else 0
+    return 1 if any(_needs_attention(r) for r in results) else 0
 
 
 def main(argv: Optional[list] = None,

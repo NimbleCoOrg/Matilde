@@ -28,7 +28,7 @@ import urllib.parse
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
-from .citations import OPENALEX_BASE, _normalize_doi, default_fetch
+from .citations import OPENALEX_BASE, _fetch_json, _normalize_doi, default_fetch
 
 FetchFn = Callable[..., dict]
 
@@ -54,6 +54,11 @@ class FullTextResult:
     source: str = ""             # which provider produced the chosen location
     license: str = ""
     candidates: list = field(default_factory=list)
+    # Providers that answered, and providers we could not reach. A lookup that
+    # failed is not evidence that no open-access copy exists, so the two are
+    # reported separately instead of both collapsing into is_oa=False.
+    sources_consulted: list = field(default_factory=list)
+    errors: list = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return dataclasses.asdict(self)
@@ -63,16 +68,23 @@ class FullTextResult:
 # Provider parsers (each returns a normalized loc dict, or None on miss)
 # ---------------------------------------------------------------------------
 
-def _try_openalex(doi: str, fetch: FetchFn) -> Optional[dict]:
-    try:
-        work = fetch(f"{OPENALEX_BASE}/works/doi:{doi}")
-    except Exception:
-        return None
+def _try_openalex(doi: str, fetch: FetchFn) -> tuple:
+    """Return ``(loc_or_None, error_or_None)``.
+
+    ``(None, None)`` means OpenAlex has no record for the DOI; ``(None, "…")``
+    means OpenAlex could not be consulted at all. Reporting both as ``None`` is
+    how "we could not check" became "there is no open-access copy".
+    """
+    work, err = _fetch_json(f"{OPENALEX_BASE}/works/doi:{doi}", fetch)
+    if err is not None:
+        return (None, f"openalex: {err}")
+    if not isinstance(work, dict) or not work:
+        return (None, None)
     oa = work.get("open_access") or {}
     best = work.get("best_oa_location") or {}
     # Only ``pdf_url`` is a guaranteed direct PDF. ``oa_url`` is the "best OA URL"
     # but is often a landing page — treat it as a landing fallback, never a PDF.
-    return {
+    return ({
         "is_oa": bool(oa.get("is_oa")),
         "oa_status": oa.get("oa_status") or "",
         "pdf_url": best.get("pdf_url") or "",
@@ -80,17 +92,19 @@ def _try_openalex(doi: str, fetch: FetchFn) -> Optional[dict]:
         "license": best.get("license") or "",
         "version": best.get("version") or "",
         "host_type": (best.get("source") or {}).get("type") or "",
-    }
+    }, None)
 
 
-def _try_unpaywall(doi: str, fetch: FetchFn, email: str) -> Optional[dict]:
+def _try_unpaywall(doi: str, fetch: FetchFn, email: str) -> tuple:
+    """Return ``(loc_or_None, error_or_None)`` — see :func:`_try_openalex`."""
     email_q = urllib.parse.quote(email)
-    try:
-        data = fetch(f"{UNPAYWALL_BASE}/{doi}?email={email_q}")
-    except Exception:
-        return None
+    data, err = _fetch_json(f"{UNPAYWALL_BASE}/{doi}?email={email_q}", fetch)
+    if err is not None:
+        return (None, f"unpaywall: {err}")
+    if not isinstance(data, dict) or not data:
+        return (None, None)
     best = data.get("best_oa_location") or {}
-    return {
+    return ({
         "is_oa": bool(data.get("is_oa")),
         "oa_status": data.get("oa_status") or "",
         "pdf_url": best.get("url_for_pdf") or "",
@@ -98,7 +112,7 @@ def _try_unpaywall(doi: str, fetch: FetchFn, email: str) -> Optional[dict]:
         "license": best.get("license") or "",
         "version": best.get("version") or "",
         "host_type": best.get("host_type") or "",
-    }
+    }, None)
 
 
 def _arxiv_pdf(doi: str) -> str:
@@ -106,7 +120,7 @@ def _arxiv_pdf(doi: str) -> str:
     return f"https://arxiv.org/pdf/{m.group(1)}" if m else ""
 
 
-def _try_external_resolver(doi: str, fetch: FetchFn, resolver_url: str) -> str:
+def _try_external_resolver(doi: str, fetch: FetchFn, resolver_url: str) -> tuple:
     """Ask a configured external full-text resolver for a PDF URL.
 
     This is a provider-neutral extension point: ``resolver_url`` points at a
@@ -115,14 +129,15 @@ def _try_external_resolver(doi: str, fetch: FetchFn, resolver_url: str) -> str:
     package ships no such service and names no provider — the operator supplies
     one out of band (an institutional proxy, a paid API, anything). Consulted
     only after every legal open-access lookup has missed.
+
+    Returns ``(pdf_url, error_or_None)``.
     """
     base = resolver_url.rstrip("/")
     doi_q = urllib.parse.quote(doi, safe="")
-    try:
-        data = fetch(f"{base}/resolve?doi={doi_q}")
-    except Exception:
-        return ""
-    return (data or {}).get("pdf_url") or ""
+    data, err = _fetch_json(f"{base}/resolve?doi={doi_q}", fetch)
+    if err is not None:
+        return ("", f"external-resolver: {err}")
+    return ((data or {}).get("pdf_url") or "", None)
 
 
 # ---------------------------------------------------------------------------
@@ -167,29 +182,53 @@ def find_open_access(doi: str, fetch: Optional[FetchFn] = None, *,
     if not doi:
         return result
 
+    consulted: list = []
+    errors: list = []
+
+    def _finish(res: FullTextResult) -> FullTextResult:
+        res.sources_consulted = consulted
+        res.errors = errors
+        return res
+
     # 1. OpenAlex (primary, no email needed)
-    oa = _try_openalex(doi, fetch)
+    oa, err = _try_openalex(doi, fetch)
+    if err:
+        errors.append(err)
+    else:
+        consulted.append("openalex")
     if oa and oa["is_oa"] and (oa["pdf_url"] or oa["landing_url"]):
-        return _from_loc(doi, oa, "openalex")
+        return _finish(_from_loc(doi, oa, "openalex"))
     if oa is not None:
         result.is_oa = oa["is_oa"]
         result.oa_status = oa["oa_status"] or "closed"
 
     # 2. Unpaywall (only with a contact email)
     if email:
-        up = _try_unpaywall(doi, fetch, email)
+        up, err = _try_unpaywall(doi, fetch, email)
+        if err:
+            errors.append(err)
+        else:
+            consulted.append("unpaywall")
         if up and up["is_oa"] and (up["pdf_url"] or up["landing_url"]):
-            return _from_loc(doi, up, "unpaywall")
+            return _finish(_from_loc(doi, up, "unpaywall"))
 
     # 3. arXiv synthesis — a registered arXiv DOI always has a legal PDF
     arx = _arxiv_pdf(doi)
     if arx:
-        return _from_loc(doi, {"pdf_url": arx, "oa_status": "green",
-                               "host_type": "repository"}, "arxiv")
+        consulted.append("arxiv")
+        return _finish(_from_loc(doi, {"pdf_url": arx, "oa_status": "green",
+                                       "host_type": "repository"}, "arxiv"))
+
+    # A provider we could not reach cannot support the conclusion "closed": we did
+    # not establish that no open-access copy exists, only that we failed to look.
+    if errors and not result.is_oa:
+        result.oa_status = "unknown"
 
     # 4. External resolver (opt-in, last resort) — full text, NOT open access.
     if resolver_url:
-        pdf = _try_external_resolver(doi, fetch, resolver_url)
+        pdf, err = _try_external_resolver(doi, fetch, resolver_url)
+        if err:
+            errors.append(err)
         if pdf:
             result.pdf_url = pdf
             result.best_url = pdf
@@ -198,4 +237,4 @@ def find_open_access(doi: str, fetch: Optional[FetchFn] = None, *,
                                   "license": "", "version": "", "host_type": "",
                                   "source": "external-resolver"}]
 
-    return result
+    return _finish(result)
