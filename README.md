@@ -164,11 +164,11 @@ something specific went wrong, and says what.
 
 | Doc | What it covers |
 |---|---|
-| [trustworthy-comparison.md](docs/trustworthy-comparison.md) | How to establish that two measured numbers are comparable before you subtract them. Case study: one comparison that was invalid four different ways across three attempts, each fix moving the bug. Plus dead constants, label columns that aren't labels, boundary optima, unseeded runs, and silent failure. |
+| [trustworthy-comparison.md](docs/trustworthy-comparison.md) | How to establish that two measured numbers are comparable before you subtract them: comparator provenance, protocol matching, split identity, tuning leakage, dead constants, label columns that aren't labels, boundary optima, unseeded runs, and silent failure. Worked through a comparison whose direction reversed once the protocol was fixed. |
 | [baseline-registry.md](docs/baseline-registry.md) | The comparator-as-record pattern — callable + tuned params + split + criterion — and why a registry returning only a *number* prevents one of those four failures and none of the others. Includes an honest list of what it still does not catch. |
 | [results-provenance-checklist.md](docs/results-provenance-checklist.md) | What a results file must carry to be reproducible from itself: seed, library versions, git SHA, the split member lists, every data-reduction decision, the matching criterion, and how the operating point was chosen. |
 | [golden-validation-recipe.md](docs/golden-validation-recipe.md) | The offline, dependency-free worked validation — the reference shape of a correct finding, and the package's smoke test. |
-| [meg-validation-study.md](docs/meg-validation-study.md) · [stateful-study-pipeline.md](docs/stateful-study-pipeline.md) | The bounded-sample validation study and the resumable step pipeline behind it. |
+| [meg-validation-study.md](docs/meg-validation-study.md) · [stateful-study-pipeline.md](docs/stateful-study-pipeline.md) | Running a memory-bounded study over an open dataset, and the resumable step store that makes it restartable. |
 | [privacy-and-visibility.md](docs/privacy-and-visibility.md) · [promotion-and-upstream.md](docs/promotion-and-upstream.md) | The privacy model, the sanitization gate, and how a technique gets promoted out of a private overlay into this package. |
 | [onboarding.md](docs/onboarding.md) | Start here if you are new to the package. |
 
