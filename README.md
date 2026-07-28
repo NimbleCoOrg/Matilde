@@ -152,9 +152,25 @@ promotion flow.
 | `matilde_plugin/engine/citations.py` | The verifiable-citations engine (the core; the part we may open-source standalone) |
 | `matilde_plugin/engine/openneuro.py` | Read-only OpenNeuro/BIDS client — discovery, metadata, files (stdlib-only) |
 | `matilde_plugin/engine/parsing.py` · `matilde_plugin/engine/cli.py` | BibTeX/DOI ingestion + the `matilde` verify CLI (`python3 -m matilde_plugin.engine.cli`) |
+| `matilde_plugin/engine/comparison.py` | Comparison registry + reproducibility guards — makes an invalid A-vs-B comparison **refuse** instead of printing a delta (stdlib-only, domain-neutral) |
 | `hermes-skill/SKILL.md` | The agent's research methodology |
 | `docker/SOUL.Matilde.md` | The research-assistant identity |
 | `tests/` | Offline unit suite + live API integration tests |
+
+## Method docs
+
+`docs/` holds the methodology this package encodes — each document exists because
+something specific went wrong, and says what.
+
+| Doc | What it covers |
+|---|---|
+| [trustworthy-comparison.md](docs/trustworthy-comparison.md) | How to establish that two measured numbers are comparable before you subtract them: comparator provenance, protocol matching, split identity, tuning leakage, dead constants, label columns that aren't labels, boundary optima, unseeded runs, and silent failure. Worked through a comparison whose direction reversed once the protocol was fixed. |
+| [baseline-registry.md](docs/baseline-registry.md) | The comparator-as-record pattern — callable + tuned params + split + criterion — and why a registry returning only a *number* prevents one of those four failures and none of the others. Includes an honest list of what it still does not catch. |
+| [results-provenance-checklist.md](docs/results-provenance-checklist.md) | What a results file must carry to be reproducible from itself: seed, library versions, git SHA, the split member lists, every data-reduction decision, the matching criterion, and how the operating point was chosen. |
+| [golden-validation-recipe.md](docs/golden-validation-recipe.md) | The offline, dependency-free worked validation — the reference shape of a correct finding, and the package's smoke test. |
+| [meg-validation-study.md](docs/meg-validation-study.md) · [stateful-study-pipeline.md](docs/stateful-study-pipeline.md) | Running a memory-bounded study over an open dataset, and the resumable step store that makes it restartable. |
+| [privacy-and-visibility.md](docs/privacy-and-visibility.md) · [promotion-and-upstream.md](docs/promotion-and-upstream.md) | The privacy model, the sanitization gate, and how a technique gets promoted out of a private overlay into this package. |
+| [onboarding.md](docs/onboarding.md) | Start here if you are new to the package. |
 
 ---
 

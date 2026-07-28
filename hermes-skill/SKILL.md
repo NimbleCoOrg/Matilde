@@ -163,6 +163,37 @@ a fully worked, dependency-free example: a planted in-window M100 that yields
 the package's smoke test; imitate its shape when judging a real result. See
 `docs/golden-validation-recipe.md`.
 
+### Before you report that A beats B
+
+A difference between two measured numbers is two claims plus an assumption — that
+both were produced under the same conditions — and that assumption is the one
+nobody checks. Before printing any comparison, confirm out loud that both arms
+share the same **split** (by its member list, not by a description of how it was
+generated), the same **evaluation function and matching criterion**, the same
+**preprocessing**, and the same **tuning protocol**. If any of those differ,
+refuse to print the comparison and say which one differs.
+
+Three rules that follow, each from a real failure:
+
+- **A number that arrives as text is a claim, not evidence.** Comparator figures
+  from a notification, a log, a chat message, or your own recall must be traced
+  to the file that produced them before being quoted. A hardcoded
+  `print(f"Baseline: F1=0.731")` once reached a completion notification and was
+  read back as a measurement.
+- **Never select an operating point on the set you report.** `max(sweep, key=f1)`
+  over a test-set sweep is an upper bound. Say so, or name the field
+  `test_set_oracle_best`. And if the best value sits at the edge of the swept
+  range, the optimum was never found — extend the range.
+- **Validate the comparison before you calibrate the number.** Hedging language
+  raises the credibility of whatever it is attached to, so attaching it to an
+  unchecked comparison is worse than stating the claim bluntly. Ask whether being
+  wrong here would mean your number is noisy or your comparison is meaningless —
+  only the first is fixed by quoting a range.
+
+Full case study and rules: `docs/trustworthy-comparison.md`. Results-file
+requirements: `docs/results-provenance-checklist.md`. Enforcement in code:
+`matilde_plugin/engine/comparison.py`.
+
 ## Iteration Pattern
 
 1. **Gather** candidate sources
