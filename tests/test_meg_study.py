@@ -26,11 +26,17 @@ import pytest
 sys.path.insert(0, os.path.normpath(os.path.join(os.path.dirname(__file__), "..")))
 
 from matilde_plugin.engine.meg_study import (  # noqa: E402
+    DEFAULT_BOUNDS,
     MIN_RELIABLE_EPOCHS,
     MegIO,
-    _EARLIEST_CORTICAL_MS,
+    _ARTIFACT_EXCLUSION_FLOOR_MS,
+    DEFAULT_WINDOW_MS,
+    _P50_UPPER_MS,
+    _P200_UPPER_MS,
     _classify,
+    _latency_zone,
     _peak_search_bounds,
+    _refute_threshold_ms,
     build_steps,
 )
 from matilde_plugin.engine.pipeline import resume, run  # noqa: E402
@@ -56,6 +62,11 @@ class FakeMegIO:
                       "measure_peak": 0}
         # Records the event_id the study asked epoch to filter to (None=all).
         self.epoch_event_id = "__unset__"
+        # Records the epoch bounds actually used, so measure_peak can report the
+        # real search range. Hardcoding DEFAULT_BOUNDS here would make the fake
+        # ignore a caller's tmax override and silently skip the falsifiability
+        # check that depends on it.
+        self.epoch_bounds = (float(DEFAULT_BOUNDS["tmin"]), float(DEFAULT_BOUNDS["tmax"]))
 
     def fetch_sample(self, *, dataset_id, bounds):
         self.calls["fetch"] += 1
@@ -69,6 +80,7 @@ class FakeMegIO:
     def epoch(self, filtered, *, tmin, tmax, event_id=None):
         self.calls["epoch"] += 1
         self.epoch_event_id = event_id
+        self.epoch_bounds = (float(tmin), float(tmax))
         return {**filtered, "n_epochs": self.n_epochs,
                 "window": [tmin, tmax], "path": "/tmp/fake_epo.fif"}
 
@@ -82,8 +94,14 @@ class FakeMegIO:
         self.calls["measure_peak"] += 1
         if self.n_epochs <= 0:  # degenerate sample -> no measurable peak
             return {"latency_ms": None, "amplitude": None, "n_epochs": 0}
+        # Report the REAL search range. Omitting it was how the fake hid the
+        # boundary-hit and falsifiability logic from every end-to-end test: the
+        # guards key off `search_ms`, so a fake without it silently skipped them.
+        lo, hi = _peak_search_bounds(window_ms, self.epoch_bounds[0],
+                                     self.epoch_bounds[1])
         return {"latency_ms": self.peak_latency_ms, "amplitude": self.peak_amp,
-                "n_epochs": self.n_epochs}
+                "n_epochs": self.n_epochs,
+                "search_ms": [lo * 1000.0, hi * 1000.0]}
 
 
 @pytest.fixture()
@@ -145,90 +163,160 @@ def test_peak_search_bounds_clamped_to_available_times():
 
 
 # ---------------------------------------------------------------------------
-# Falsifiability: `refuted` must be REACHABLE from the real search range.
+# Falsifiability, and the harder question of IDENTIFIABILITY.
 #
-# The refuted tests elsewhere in this file all drive FakeMegIO, which returns a
-# latency directly and never consults _peak_search_bounds. That hid a defect: the
-# real backend takes its peak as the argmax INSIDE the search range, so if the
-# search range cannot produce a latency that _classify calls "refuted", the
-# hypothesis cannot fail no matter what the data says.
+# `refuted` must be reachable from the real search range, or the prediction
+# cannot fail. But reachable is not enough: the peak is a polarity-blind
+# (mode="abs") argmax, so any latency sitting where another auditory component
+# lives is more likely that component than a displaced M100. A `refuted` drawn
+# from P50 or P200 territory is a misidentification wearing a verdict.
 #
-# These tests compose the two pure helpers -- the composition the fake skips.
+# So the contract is: refutation fires only beyond the last canonical component,
+# and everything ambiguous degrades to `inconclusive` with a named caveat.
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize("window", [(80.0, 120.0), (70.0, 130.0),
-                                    (50.0, 150.0), (100.0, 100.0)])
-def test_refuted_is_reachable_from_the_real_search_range(window):
-    """Some latency the search can actually return must classify as refuted.
-
-    Sweep the achievable range at 0.1 ms and require all three verdicts to be
-    possible. If only {supported, inconclusive} appear, the study is
-    unfalsifiable by construction.
-    """
-    lo_s, hi_s = _peak_search_bounds(window, times_lo=-0.1, times_hi=0.3)
-    lo_ms, hi_ms = lo_s * 1000.0, hi_s * 1000.0
-
-    verdicts = set()
-    n = int(round((hi_ms - lo_ms) / 0.1))
-    for i in range(n + 1):
-        verdicts.add(_classify(lo_ms + i * 0.1, window))
-
-    assert "refuted" in verdicts, (
-        f"window {window}: search range [{lo_ms:.1f}, {hi_ms:.1f}] ms can only "
-        f"produce {sorted(verdicts)} -- 'refuted' is unreachable, so the "
+def test_late_refutation_is_reachable_from_the_real_search_range():
+    """The realistic failure direction must be achievable."""
+    lo_s, hi_s = _peak_search_bounds(DEFAULT_WINDOW_MS, times_lo=-0.1, times_hi=0.3)
+    assert _classify(hi_s * 1000.0, DEFAULT_WINDOW_MS) == "refuted", (
+        f"latest searchable peak {hi_s * 1000:.1f} ms is not refutable — the "
         f"prediction cannot fail"
     )
 
 
-@pytest.mark.parametrize("window", [(80.0, 120.0), (70.0, 130.0), (50.0, 150.0)])
-def test_late_refutation_is_always_reachable(window):
-    """The late side of the search must always extend past the refute threshold.
-
-    A genuine auditory peak arriving too late is the realistic way this
-    prediction fails, so this side must never be clamped shut.
-    """
-    _, hi_s = _peak_search_bounds(window, times_lo=-1.0, times_hi=1.0)
-    hi_ms = hi_s * 1000.0
-    assert _classify(hi_ms, window) == "refuted", (
-        f"window {window}: latest searchable peak {hi_ms:.1f} ms is not refuted"
+def test_search_range_contains_the_late_refutation_threshold():
+    """The invariant. Search must extend PAST the threshold, not up to it."""
+    _, hi_s = _peak_search_bounds(DEFAULT_WINDOW_MS, times_lo=-1.0, times_hi=1.0)
+    thresh = _refute_threshold_ms(DEFAULT_WINDOW_MS)
+    assert hi_s * 1000.0 > thresh, (
+        f"search ceiling {hi_s * 1000:.1f} ms does not exceed the refute "
+        f"threshold {thresh:.1f} ms"
     )
 
 
-@pytest.mark.parametrize("window", [(80.0, 120.0), (70.0, 130.0), (50.0, 150.0)])
-def test_early_refutation_is_reachable_unless_physiology_floors_it(window):
-    """Early-side refutation may be legitimately unreachable -- but only for one
-    reason, and the reason must be the physiological floor.
+def test_peak_at_the_search_floor_is_not_a_confident_refutation():
+    """THE REGRESSION GUARD.
 
-    For a window starting at 50 ms the plausibility band's early edge (30 ms)
-    coincides with ``_EARLIEST_CORTICAL_MS``, so the search cannot go below the
-    refute threshold. That is correct: "too early to be plausible" and "too early
-    to be a cortical response at all" have converged, and we decline to search
-    sub-cortical latencies just to manufacture a refutation. What must never
-    happen is the early side being closed by an arbitrary search margin -- which
-    is what the pre-2026-07-30 code did at every window.
+    An argmax pinned to the search floor means the true extremum is probably
+    outside the range — classically the ~15 ms stimulus artifact smeared upward
+    by the band-pass. Widening the search to gain falsifiability must not convert
+    that into a confident `refuted`. An earlier revision of this module did
+    exactly that: floor 40 ms with an early refute threshold of 60 ms, so the
+    artifact returned `refuted` where the previous code said `inconclusive`.
     """
-    lo_s, _ = _peak_search_bounds(window, times_lo=-1.0, times_hi=1.0)
-    lo_ms = lo_s * 1000.0
-    if _classify(lo_ms, window) != "refuted":
-        assert lo_ms == pytest.approx(_EARLIEST_CORTICAL_MS), (
-            f"window {window}: early refutation unreachable and the search floor "
-            f"({lo_ms:.1f} ms) is NOT the physiological floor "
-            f"({_EARLIEST_CORTICAL_MS} ms) -- an arbitrary margin has closed it"
-        )
+    lo_s, _ = _peak_search_bounds(DEFAULT_WINDOW_MS, times_lo=-0.1, times_hi=0.3)
+    assert _classify(lo_s * 1000.0, DEFAULT_WINDOW_MS) != "refuted", (
+        f"a peak at the search floor ({lo_s * 1000:.1f} ms) is reported as "
+        f"refuted — the artifact incident, relocated"
+    )
 
 
-def test_stimulus_artifact_stays_outside_the_search():
-    """The original bug's regression guard, preserved while widening the search.
+@pytest.mark.parametrize("latency,zone", [
+    (45.0, "p50_ambiguous"),      # Pa/P50 territory — this dataset has one ~50 ms
+    (65.0, "p50_ambiguous"),
+    (100.0, "supported"),
+    (140.0, "off_window_late"),
+    (190.0, "p200_ambiguous"),    # P200 territory
+    (260.0, "refutable"),         # beyond every canonical component
+])
+def test_latency_zones_are_component_aware(latency, zone):
+    assert _latency_zone(latency, DEFAULT_WINDOW_MS) == zone
 
-    Widening the range to make `refuted` reachable must NOT reach back to the
-    ~15 ms stimulus artifact that the +/-100 ms search mistook for the M100.
+
+@pytest.mark.parametrize("latency", [45.0, 65.0, 190.0])
+def test_known_component_territory_is_never_refuted(latency):
+    """P50 and P200 latencies degrade to inconclusive, not refuted."""
+    assert _classify(latency, DEFAULT_WINDOW_MS) == "inconclusive"
+
+
+def test_artifact_floor_is_an_absolute_bound_not_a_derived_one():
+    """Kills the mutant `_ARTIFACT_EXCLUSION_FLOOR_MS = 75.0`.
+
+    The previous version of this assertion compared the floor to the same
+    constant that produced it, so it held for any value. Pin it absolutely:
+    above the artifact, below the earliest plausible M100.
     """
-    lo_s, _ = _peak_search_bounds((80.0, 120.0), times_lo=-0.1, times_hi=0.3)
-    assert lo_s > 0.015, f"search starts at {lo_s * 1000:.1f} ms, at/below the artifact"
-    # And no window may drag the floor below the earliest plausible cortical response.
-    for window in [(80.0, 120.0), (50.0, 150.0), (100.0, 100.0)]:
-        lo_s, _ = _peak_search_bounds(window, times_lo=-1.0, times_hi=1.0)
-        assert lo_s >= 0.03, f"{window}: floor {lo_s * 1000:.1f} ms is sub-cortical"
+    assert 20.0 <= _ARTIFACT_EXCLUSION_FLOOR_MS <= 50.0
+    lo, _ = _peak_search_bounds(DEFAULT_WINDOW_MS, times_lo=-0.1, times_hi=0.3)
+    assert lo > 0.015, "search reaches the ~15 ms stimulus artifact"
+    assert lo <= DEFAULT_WINDOW_MS[0] / 1000.0, "floor excludes the window itself"
+
+
+def test_search_ceiling_is_bounded():
+    """Kills the mutant `_SEARCH_BEYOND_BAND_MS = 500.0`.
+
+    Previously the only assertion on `hi` was a LOWER bound, so the search could
+    be widened without limit and the suite stayed green.
+    """
+    _, hi = _peak_search_bounds(DEFAULT_WINDOW_MS, times_lo=-1.0, times_hi=1.0)
+    assert hi <= 0.30, f"search ceiling {hi * 1000:.0f} ms is unbounded"
+
+
+def test_p50_boundary_is_pinned():
+    """Kills mutants on the component boundaries themselves."""
+    assert _latency_zone(_P50_UPPER_MS, DEFAULT_WINDOW_MS) == "p50_ambiguous"
+    assert _latency_zone(_P50_UPPER_MS + 0.1, DEFAULT_WINDOW_MS) == "off_window_early"
+    assert _latency_zone(_P200_UPPER_MS, DEFAULT_WINDOW_MS) == "p200_ambiguous"
+    assert _latency_zone(_P200_UPPER_MS + 0.1, DEFAULT_WINDOW_MS) == "refutable"
+
+
+def test_peak_on_the_search_boundary_is_downgraded_end_to_end(store):
+    """THE REGRESSION GUARD, through the whole pipeline.
+
+    A peak sitting on the search floor is what the ~15 ms stimulus artifact looks
+    like once the band-pass smears it into the searchable range. It must come back
+    `inconclusive` with a `boundary_hit` caveat and a next step — never a
+    confident verdict. An earlier revision returned `refuted` here.
+    """
+    lo, _ = _peak_search_bounds(DEFAULT_WINDOW_MS, float(DEFAULT_BOUNDS["tmin"]),
+                                float(DEFAULT_BOUNDS["tmax"]))
+    sid = store.create_study(slug="meg-edge-lo", title="edge", plan=_plan())
+    io = FakeMegIO(peak_latency_ms=lo * 1000.0, n_epochs=40)
+    run(store, sid, build_steps(dataset_id="bst_auditory", io=io))
+    f = store.get_findings(sid)[0]
+    assert f["verdict"] == "inconclusive", f["verdict"]
+    caveats = f["evidence"].get("caveats") or []
+    assert any("boundary_hit" in c for c in caveats), caveats
+    assert f["evidence"].get("next_step")
+
+
+def test_p200_latency_is_not_reported_as_refuted_end_to_end(store):
+    """190 ms is P200 territory. A polarity-blind argmax cannot call that a
+    displaced M100, so it degrades with a named component caveat."""
+    sid = store.create_study(slug="meg-p200", title="p200", plan=_plan())
+    io = FakeMegIO(peak_latency_ms=190.0, n_epochs=40)
+    run(store, sid, build_steps(dataset_id="bst_auditory", io=io))
+    f = store.get_findings(sid)[0]
+    assert f["verdict"] == "inconclusive", f["verdict"]
+    caveats = f["evidence"].get("caveats") or []
+    assert any("component_ambiguous" in c for c in caveats), caveats
+
+
+def test_short_epoch_flags_the_claim_as_untestable(store):
+    """If the epoch cannot reach the refutation threshold, `supported` was the
+    only attainable answer and must be labelled untested rather than confirmed."""
+    sid = store.create_study(slug="meg-short", title="short", plan=_plan())
+    io = FakeMegIO(peak_latency_ms=100.0, n_epochs=40)
+    run(store, sid, build_steps(dataset_id="bst_auditory", io=io,
+                                bounds={**DEFAULT_BOUNDS, "tmax": 0.15}))
+    f = store.get_findings(sid)[0]
+    assert f["verdict"] == "supported"
+    caveats = f["evidence"].get("caveats") or []
+    assert any("unfalsifiable_late" in c for c in caveats), caveats
+
+
+def test_falsifiability_holds_under_the_shipped_epoch_bounds():
+    """Bind the invariant to DEFAULT_BOUNDS, not hardcoded times.
+
+    Mutating `tmax` must not silently close refutation with a green suite.
+    """
+    tmax = float(DEFAULT_BOUNDS["tmax"])
+    _, hi_s = _peak_search_bounds(DEFAULT_WINDOW_MS, times_lo=float(DEFAULT_BOUNDS["tmin"]),
+                                  times_hi=tmax)
+    assert _classify(hi_s * 1000.0, DEFAULT_WINDOW_MS) == "refuted", (
+        f"under the shipped epoch (tmax={tmax}s) refutation is unreachable"
+    )
+
 
 
 # ---------------------------------------------------------------------------
@@ -291,11 +379,11 @@ def test_happy_path_peak_within_window_is_supported(store):
 
 def test_peak_far_outside_window_is_refuted(store):
     sid = store.create_study(slug="r", title="R", plan=_plan())
-    io = FakeMegIO(peak_latency_ms=300.0)
+    io = FakeMegIO(peak_latency_ms=225.0)
     run(store, sid, build_steps(dataset_id="bst_auditory", io=io))
     f = store.get_findings(sid)[0]
     assert f["verdict"] == "refuted"
-    assert f["evidence"]["latency_ms"] == 300.0
+    assert f["evidence"]["latency_ms"] == 225.0
 
 
 def test_degenerate_sample_is_inconclusive(store):
@@ -416,20 +504,20 @@ def test_live_bst_auditory_m100_bounded():
 def test_out_of_window_peak_from_few_epochs_is_inconclusive_not_refuted(store):
     sid = store.create_study(slug="meg-weak", title="weak", plan=_plan())
     # Peak far outside the 80-120 window, but only a handful of epochs.
-    io = FakeMegIO(peak_latency_ms=300.0, n_epochs=MIN_RELIABLE_EPOCHS - 1)
+    io = FakeMegIO(peak_latency_ms=225.0, n_epochs=MIN_RELIABLE_EPOCHS - 1)
     run(store, sid, build_steps(dataset_id="bst_auditory", io=io))
     f = store.get_findings(sid)[0]
     assert f["verdict"] == "inconclusive"
     assert f["evidence"]["caveats"], "low-evidence caveat expected"
     assert f["evidence"].get("next_step"), "a stated next step expected"
     # The raw measurement is still reported for transparency.
-    assert f["evidence"]["latency_ms"] == 300.0
+    assert f["evidence"]["latency_ms"] == 225.0
 
 
 def test_out_of_window_peak_from_enough_epochs_still_refuted(store):
     # With a reliable epoch count, an out-of-window peak is a real refutation.
     sid = store.create_study(slug="meg-strong", title="strong", plan=_plan())
-    io = FakeMegIO(peak_latency_ms=300.0, n_epochs=MIN_RELIABLE_EPOCHS + 5)
+    io = FakeMegIO(peak_latency_ms=225.0, n_epochs=MIN_RELIABLE_EPOCHS + 5)
     run(store, sid, build_steps(dataset_id="bst_auditory", io=io))
     f = store.get_findings(sid)[0]
     assert f["verdict"] == "refuted"
@@ -440,7 +528,7 @@ def test_min_reliable_epochs_boundary_is_inclusive(store):
     # Exactly MIN_RELIABLE_EPOCHS is "reliable" (the gate is `< threshold`), so an
     # out-of-window peak at the boundary is a real refutation, not a downgrade.
     sid = store.create_study(slug="meg-edge", title="edge", plan=_plan())
-    io = FakeMegIO(peak_latency_ms=300.0, n_epochs=MIN_RELIABLE_EPOCHS)
+    io = FakeMegIO(peak_latency_ms=225.0, n_epochs=MIN_RELIABLE_EPOCHS)
     run(store, sid, build_steps(dataset_id="bst_auditory", io=io))
     f = store.get_findings(sid)[0]
     assert f["verdict"] == "refuted"

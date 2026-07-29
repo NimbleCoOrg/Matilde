@@ -56,7 +56,7 @@ def test_golden_recipe_demonstrates_skeptical_inconclusive(tmp_path):
     sid = store.create_study(
         slug="golden-weak", title="golden-weak",
         plan=["fetch_sample", "preprocess", "epoch", "evoked", "validate_finding"])
-    steps = build_golden_steps(peak_latency_ms=300.0,
+    steps = build_golden_steps(peak_latency_ms=225.0,
                                n_epochs=MIN_RELIABLE_EPOCHS - 1)
     run(store, sid, steps)
 
