@@ -243,7 +243,7 @@ def test_artifact_floor_is_an_absolute_bound_not_a_derived_one():
 
 
 def test_search_ceiling_is_bounded():
-    """Kills the mutant `_SEARCH_BEYOND_BAND_MS = 500.0`.
+    """Kills the mutant `_SEARCH_CEILING_MS = 900.0`.
 
     Previously the only assertion on `hi` was a LOWER bound, so the search could
     be widened without limit and the suite stayed green.
