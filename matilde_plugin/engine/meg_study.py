@@ -76,17 +76,98 @@ DEFAULT_BOUNDS: Dict[str, Any] = {
     "event_id": None,
 }
 
-# How far outside the expected window a measured peak must fall before the finding
-# is called ``refuted`` (rather than merely off-window). Inside the window ->
-# supported; clearly outside (beyond this margin) -> refuted; just off it ->
-# inconclusive (not clear-cut either way).
-_REFUTE_MARGIN_MS = 50.0
+# Verdict geometry. Read this before touching any number here.
+#
+# The peak is a polarity-blind argmax (``mode="abs"``) over a search range. That
+# makes two failure modes possible, and they pull in OPPOSITE directions:
+#
+#   * Too NARROW a search and ``refuted`` becomes unreachable — the argmax is
+#     confined to latencies the hypothesis already accepts, so the prediction
+#     cannot fail. This module shipped that state between e079993 and 2026-07-30:
+#     search was window +/-10 ms while refutation needed window +/-50 ms, so no
+#     measurement at any configured window could return ``refuted``.
+#   * Too WIDE a search and the argmax starts catching things that are not the
+#     M100 — the ~15 ms stimulus artifact (the original bug), the P50/Pa around
+#     30-70 ms, the P200 around 170-215 ms. A ``refuted`` drawn from any of those
+#     is a misidentified component wearing a verdict.
+#
+# So width alone cannot fix this. The resolution is to search wide enough to
+# contain the refutation threshold, and then refuse to refute anywhere a known
+# component could plausibly be the winner:
+#
+#     30 ms          70 ms      window      170 ms      215 ms        280 ms
+#   ----|--------------|---------[==]---------|-----------|-------------|----
+#       floor      P50/Pa      supported    off-window   P200        ceiling
+#       (artifact  ambiguous                 late      ambiguous   refutable -->
+#        excluded)  -> inconclusive                  -> inconclusive
+#
+# Consequence stated plainly: **early refutation is not achievable this way.**
+# Everything early enough to contradict the M100 is also P50/Pa territory. A
+# genuinely absent M100 has to be established from amplitude/SNR or topography,
+# not latency — see "Still open" in docs/meg-validation-study.md. Pretending
+# otherwise by putting a refute threshold inside the P50 band is what the
+# 2026-07-30 revision did, and it reproduced the artifact incident at 40 ms.
 
-# Small symmetric slack (ms) added around the expected window when searching for
-# the peak, so a peak landing right at an edge is still captured. Deliberately
-# tiny: a wide search (the old +/-100 ms) grabbed the large early stimulus
-# artifact (~15 ms) instead of the in-window auditory peak (~100-120 ms).
-_PEAK_SEARCH_MARGIN_MS = 10.0
+# Floor for the peak search. NOT "the earliest cortical response" — cortical
+# auditory activity starts far earlier than this (Na ~19 ms, Pa ~28 ms in medial
+# Heschl's gyrus). It is an ARTIFACT EXCLUSION bound: high enough to keep the
+# ~15 ms stimulus artifact and its band-pass smearing out of the argmax, low
+# enough to sit below any plausible M100.
+_ARTIFACT_EXCLUSION_FLOOR_MS = 30.0
+
+# Upper edge of P50/Pa territory. At or below this a peak is not attributable to
+# a displaced M100 by latency alone.
+_P50_UPPER_MS = 70.0
+
+# P200 territory. A peak in here is more likely the P200 than a very late M100.
+_P200_LOWER_MS = 170.0
+_P200_UPPER_MS = 215.0
+
+# Hard ceiling on the search, inside DEFAULT_BOUNDS["tmax"] (0.3 s). Beyond the
+# P200 there is no canonical component to confuse the argmax, so this span is
+# where refutation is both reachable and identifiable.
+_SEARCH_CEILING_MS = 280.0
+
+# Margin by which the search must exceed the refutation threshold, so the
+# threshold is strictly contained rather than merely touched.
+_SEARCH_BEYOND_THRESHOLD_MS = 20.0
+
+# How far past the expected window a peak must fall before it is refutable, when
+# the window itself sits late enough that the P200 bound is not the binding one.
+_PLAUSIBLE_LATE_MS = 60.0
+
+
+def _refute_threshold_ms(window_ms: Tuple[float, float]) -> float:
+    """Latency above which a peak refutes the prediction.
+
+    Binding constraint is whichever is later: the end of P200 territory, or a
+    generous margin past the expected window. Pure, so the falsifiability
+    invariant is unit-testable without the scientific stack.
+    """
+    return max(_P200_UPPER_MS, window_ms[1] + _PLAUSIBLE_LATE_MS)
+
+
+def _latency_zone(latency_ms: Optional[float],
+                  window_ms: Tuple[float, float]) -> str:
+    """Which interpretive region a measured latency falls in.
+
+    Separated from ``_classify`` so the zones can be asserted directly — the
+    verdict alone cannot distinguish "off-window" from "another component", and
+    that distinction is the whole point.
+    """
+    if latency_ms is None:
+        return "no_peak"
+    lo, hi = window_ms
+    if lo <= latency_ms <= hi:
+        return "supported"
+    if latency_ms <= _P50_UPPER_MS:
+        return "p50_ambiguous"
+    if _P200_LOWER_MS <= latency_ms <= _P200_UPPER_MS:
+        return "p200_ambiguous"
+    if latency_ms > _refute_threshold_ms(window_ms):
+        return "refutable"
+    return "off_window_early" if latency_ms < lo else "off_window_late"
+
 
 # Below this many epochs the evoked average is noise-dominated, so an out-of-
 # window (or absent) peak is more likely a weak-sample artifact than a real
@@ -101,21 +182,23 @@ MIN_RELIABLE_EPOCHS = 8
 
 def _peak_search_bounds(window_ms: Tuple[float, float],
                         times_lo: float, times_hi: float) -> Tuple[float, float]:
-    """Compute the (tmin, tmax) seconds to search for the evoked peak.
+    """The (tmin, tmax) seconds to search for the evoked peak.
 
-    Pure and mne-free so it is unit-testable without the scientific stack. The
-    search stays WITHIN the expected ``window_ms`` plus only a small symmetric
-    margin (``_PEAK_SEARCH_MARGIN_MS``), then is clamped to the available sample
-    times ``[times_lo, times_hi]`` (seconds).
+    Spans ``_ARTIFACT_EXCLUSION_FLOOR_MS`` to ``_SEARCH_BEYOND_THRESHOLD_MS``
+    past the refutation threshold, then clamps to the available sample times.
+    Pure and mne-free.
 
-    This is the regression boundary for the M100 bug: a wide (+/-100 ms) search
-    over an 80-120 ms window reached back to the ~15 ms stimulus artifact and
-    reported it as the peak. Keeping the search in-window prevents that.
+    The clamp can still leave the threshold outside the range when the recording
+    is too short (or the window sits very late). That is a real limit of the
+    sample, not a classifier bug — callers detect it via
+    ``_refute_threshold_ms`` and emit an ``unfalsifiable_late`` caveat rather
+    than reporting a verdict that could not have been contradicted.
     """
-    lo_s = window_ms[0] / 1000.0 - _PEAK_SEARCH_MARGIN_MS / 1000.0
-    hi_s = window_ms[1] / 1000.0 + _PEAK_SEARCH_MARGIN_MS / 1000.0
-    lo = max(times_lo, lo_s)
-    hi = min(times_hi, hi_s)
+    lo_ms = min(_ARTIFACT_EXCLUSION_FLOOR_MS, window_ms[0])
+    hi_ms = min(_SEARCH_CEILING_MS,
+                _refute_threshold_ms(window_ms) + _SEARCH_BEYOND_THRESHOLD_MS)
+    lo = max(times_lo, lo_ms / 1000.0)
+    hi = min(times_hi, hi_ms / 1000.0)
     return lo, hi
 
 
@@ -260,18 +343,22 @@ class _MneIO:
         ev = mne.read_evokeds(evoked_handle["path"], verbose="ERROR")[0]
         if n_epochs <= 0 or len(ev.times) == 0:
             return {"latency_ms": None, "amplitude": None, "n_epochs": n_epochs}
-        # Search WITHIN the expected window (+/- a small margin), clamped to the
-        # available sample times. A wide search reaches the large early stimulus
-        # artifact (~15 ms) and misreports it as the auditory peak; the pure
-        # helper below keeps the search in-window (see _peak_search_bounds).
+        # Search from the artifact-exclusion floor to past the refutation
+        # threshold, clamped to the available sample times. Wide enough that the
+        # prediction can fail, floored so the ~15 ms stimulus artifact cannot win
+        # the argmax. See the verdict-geometry comment near the constants — the
+        # two constraints pull opposite ways and the floor is what reconciles
+        # them. `mode="abs"` is polarity-blind, which is why a peak in P50/P200
+        # territory is caveated rather than refuted downstream.
         lo, hi = _peak_search_bounds(window_ms, float(ev.times[0]),
                                      float(ev.times[-1]))
         ch, latency_s, amp = ev.get_peak(tmin=lo, tmax=hi, mode="abs",
                                          return_amplitude=True)
         return {"latency_ms": float(latency_s) * 1000.0,
                 "amplitude": float(amp), "n_epochs": n_epochs, "channel": ch,
-                # The actual in-window search bounds (ms) used for this peak — a
-                # diagnostic so the verdict's provenance is inspectable (#14).
+                # The actual search bounds (ms) used for this peak. Load-bearing,
+                # not just diagnostic: _validate_finding_step reads these to
+                # detect a boundary-pinned argmax and an unfalsifiable range.
                 "search_ms": [lo * 1000.0, hi * 1000.0]}
 
 
@@ -282,15 +369,18 @@ class _MneIO:
 
 def _classify(latency_ms: Optional[float],
               window_ms: Tuple[float, float]) -> str:
-    """Verdict for a measured peak latency against the expected window."""
-    lo, hi = window_ms
-    if latency_ms is None:
-        return "inconclusive"           # degenerate sample / no measurable peak
-    if lo <= latency_ms <= hi:
-        return "supported"              # within the expected window
-    if latency_ms < lo - _REFUTE_MARGIN_MS or latency_ms > hi + _REFUTE_MARGIN_MS:
-        return "refuted"                # clearly outside
-    return "inconclusive"              # just off the window — not clear-cut
+    """Verdict for a measured peak latency against the expected window.
+
+    Only the ``refutable`` zone yields ``refuted``. Everything a known component
+    could account for degrades to ``inconclusive`` — see the verdict geometry
+    comment above for why that is not timidity but identifiability.
+    """
+    zone = _latency_zone(latency_ms, window_ms)
+    if zone == "supported":
+        return "supported"
+    if zone == "refutable":
+        return "refuted"
+    return "inconclusive"
 
 
 def _fetch_sample_step(io: Any, dataset_id: str, bounds: dict) -> Step:
@@ -372,6 +462,59 @@ def _validate_finding_step(io: Any, dataset_id: str,
         # `inconclusive` with a next step — never silently accepted.
         caveats: List[str] = []
         next_step = None
+
+        # An argmax pinned to the edge of the search range is evidence the true
+        # extremum lies OUTSIDE the range, not that the M100 moved there. This is
+        # how the original incident happened: a search reaching down to the ~15 ms
+        # stimulus artifact returned the artifact as "the peak" and called a
+        # textbook finding refuted. Widening the search to make refutation
+        # reachable reintroduces the same hazard at the new boundary, so the
+        # boundary itself must never produce a confident verdict.
+        search = peak.get("search_ms") or []
+        if latency is not None and len(search) == 2:
+            s_lo, s_hi = float(search[0]), float(search[1])
+            # One sample period at the sample rates in use here is well under a
+            # millisecond; 1 ms is a deliberately generous "at the edge" band.
+            at_edge = min(abs(latency - s_lo), abs(latency - s_hi)) <= 1.0
+            if at_edge:
+                caveats.append(
+                    f"boundary_hit: the peak ({latency:.1f} ms) sits at the edge "
+                    f"of the search range [{s_lo:.1f}, {s_hi:.1f}] ms, which "
+                    f"usually means the real extremum is outside it — an "
+                    f"artifact or a later component, not a displaced M100")
+                if verdict != "supported":
+                    verdict = "inconclusive"
+                    next_step = (
+                        "Peak landed on the search boundary. Widen the epoch "
+                        "(DEFAULT_BOUNDS tmax) or inspect the evoked intermediate "
+                        "before drawing any conclusion from this latency.")
+
+        # Falsifiability check on the ACTUAL clamped range. If the recording (or a
+        # very late window) leaves the refute threshold outside the searchable
+        # span, then `supported` was the only attainable answer and must not be
+        # reported as though it survived a test it could not have failed.
+        thresh = _refute_threshold_ms(window_ms)
+        if len(search) == 2 and float(search[1]) <= thresh:
+            caveats.append(
+                f"unfalsifiable_late: the search ceiling ({float(search[1]):.1f} "
+                f"ms) does not reach the refutation threshold ({thresh:.1f} ms), "
+                f"so no measurable latency could have refuted this claim. Treat "
+                f"a `supported` here as untested, not confirmed")
+
+        # Latency alone cannot separate a displaced M100 from a neighbouring
+        # component, so name which one is in play rather than implying a verdict.
+        zone = _latency_zone(latency, window_ms)
+        if zone == "p50_ambiguous":
+            caveats.append(
+                f"component_ambiguous: {latency:.1f} ms is P50/Pa territory "
+                f"(<= {_P50_UPPER_MS:.0f} ms). A polarity-blind argmax cannot "
+                f"tell an early component from an absent M100")
+        elif zone == "p200_ambiguous":
+            caveats.append(
+                f"component_ambiguous: {latency:.1f} ms is P200 territory "
+                f"({_P200_LOWER_MS:.0f}-{_P200_UPPER_MS:.0f} ms). More likely the "
+                f"P200 than a very late M100")
+
         low_evidence = isinstance(n_epochs, int) and n_epochs < MIN_RELIABLE_EPOCHS
         if low_evidence:
             caveats.append(
@@ -498,7 +641,17 @@ class SyntheticMegIO:
         if self.n_epochs <= 0:
             return {"latency_ms": None, "amplitude": None, "n_epochs": 0,
                     "channel": None, "search_ms": list(window_ms)}
-        lo, hi = _peak_search_bounds(window_ms, -0.1, 0.3)
+        lo, hi = _peak_search_bounds(window_ms, float(DEFAULT_BOUNDS["tmin"]),
+                                     float(DEFAULT_BOUNDS["tmax"]))
+        # A planted peak outside the search range is evidence that could not have
+        # been produced by the real pipeline. This is the reference artefact
+        # agents are pointed at, so refuse to emit an impossible one rather than
+        # teaching the shape of a self-contradicting finding.
+        if not (lo * 1000.0 <= self.peak_latency_ms <= hi * 1000.0):
+            raise ValueError(
+                f"planted peak {self.peak_latency_ms} ms is outside the search "
+                f"range [{lo * 1000.0:.1f}, {hi * 1000.0:.1f}] ms for window "
+                f"{window_ms}; the real pipeline could never return it")
         return {"latency_ms": self.peak_latency_ms, "amplitude": self.peak_amp,
                 "n_epochs": self.n_epochs, "channel": "MEG 1631",
                 "search_ms": [lo * 1000.0, hi * 1000.0]}

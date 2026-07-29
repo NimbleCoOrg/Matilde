@@ -45,7 +45,7 @@ A correct finding carries the material to **sanity-check** it, not just a verdic
 | `verdict` | `supported` | in-window peak from a reliable sample |
 | `latency_ms` | `100.0` | the planted peak |
 | `expected_window_ms` | `[80.0, 120.0]` | the auditory M100 window |
-| `search_window_ms` | in-window bounds | provenance of the measurement (not the old ±100 ms widening) |
+| `search_window_ms` | `[30.0, 235.0]` | provenance of the measurement. Floor excludes the ~15 ms artifact; ceiling clears the 215 ms refutation threshold so the claim could actually have failed |
 | `n_epochs` | `40` | above `MIN_RELIABLE_EPOCHS`, so the average is trustworthy |
 | `channel` | the peak channel | which sensor carried it |
 | `caveats` | `[]` | nothing to flag |
@@ -57,7 +57,7 @@ thin, out-of-window sample:
 
 ```python
 from matilde_plugin.engine.meg_study import build_golden_steps, MIN_RELIABLE_EPOCHS
-steps = build_golden_steps(peak_latency_ms=300.0, n_epochs=MIN_RELIABLE_EPOCHS - 1)
+steps = build_golden_steps(peak_latency_ms=225.0, n_epochs=MIN_RELIABLE_EPOCHS - 1)
 ```
 
 This does **not** return a confident `refuted`. Because the epoch count is below
