@@ -28,6 +28,8 @@ sys.path.insert(0, os.path.normpath(os.path.join(os.path.dirname(__file__), ".."
 from matilde_plugin.engine.meg_study import (  # noqa: E402
     MIN_RELIABLE_EPOCHS,
     MegIO,
+    _EARLIEST_CORTICAL_MS,
+    _classify,
     _peak_search_bounds,
     build_steps,
 )
@@ -103,24 +105,36 @@ def test_fakeio_satisfies_contract():
 
 
 # ---------------------------------------------------------------------------
-# Regression: the peak-search bounds must stay WITHIN the expected window.
+# Regression: the peak search must exclude the early stimulus artifact.
 #
 # The original bug widened the search by +/-100 ms, so an 80-120 ms M100 window
 # became a ~-20..220 ms search that grabbed the large ~15 ms stimulus artifact
-# instead of the real ~100 ms auditory peak (reported 15 ms -> "refuted"). This
-# pure, mne-free helper is the unit that would have caught it.
+# instead of the real ~100 ms auditory peak (reported 15 ms -> "refuted").
+#
+# The first fix over-corrected, clamping the search to window +/-10 ms. That
+# excluded the artifact but also made the search NARROWER than the refutation
+# thresholds, so `refuted` became unreachable at every window (see the
+# falsifiability section below). The bound that matters is the physiological
+# floor, not a narrow band around the window.
 # ---------------------------------------------------------------------------
 
-def test_peak_search_bounds_stay_in_window_not_widened_by_100ms():
-    # Wide available times (e.g. -0.1 .. 0.3 s) must NOT let the search escape
-    # the expected window. For an 80-120 ms window we expect ~0.08..0.12 s,
-    # never the -0.02..0.22 s that the +/-100 ms bug produced.
+def test_peak_search_bounds_exclude_the_artifact_without_pinning_the_window():
+    """Guards the original bug by its CAUSE, not by a narrow numeric range.
+
+    This test used to assert the search stayed inside ~0.06..0.14 s for an
+    80-120 ms window. That over-fitted the fix: it made the search narrower than
+    the refutation thresholds, which is what rendered `refuted` unreachable (see
+    the falsifiability tests below). The defect the original bug actually had was
+    reaching the ~15 ms stimulus artifact -- so assert *that*, and leave the upper
+    bound free for the falsifiability invariant to constrain.
+    """
     lo, hi = _peak_search_bounds((80.0, 120.0), times_lo=-0.1, times_hi=0.3)
-    # A small symmetric margin is allowed, but nothing near +/-100 ms.
-    assert lo >= 0.06 and lo <= 0.08, lo      # not -0.02
-    assert hi >= 0.12 and hi <= 0.14, hi      # not 0.22
-    # And explicitly: the early stimulus artifact at ~15 ms is OUTSIDE the search.
-    assert lo > 0.015
+    # The thing that actually went wrong: the artifact must be out of range.
+    assert lo > 0.015, f"search reaches the ~15 ms artifact at {lo * 1000:.1f} ms"
+    # Still anchored in physiology, not arbitrarily wide on the early side.
+    assert lo >= 0.03, f"search floor {lo * 1000:.1f} ms is sub-cortical"
+    # And the window itself is still inside the search.
+    assert lo <= 0.080 and hi >= 0.120
 
 
 def test_peak_search_bounds_clamped_to_available_times():
@@ -128,6 +142,93 @@ def test_peak_search_bounds_clamped_to_available_times():
     lo, hi = _peak_search_bounds((80.0, 120.0), times_lo=0.09, times_hi=0.11)
     assert lo == 0.09
     assert hi == 0.11
+
+
+# ---------------------------------------------------------------------------
+# Falsifiability: `refuted` must be REACHABLE from the real search range.
+#
+# The refuted tests elsewhere in this file all drive FakeMegIO, which returns a
+# latency directly and never consults _peak_search_bounds. That hid a defect: the
+# real backend takes its peak as the argmax INSIDE the search range, so if the
+# search range cannot produce a latency that _classify calls "refuted", the
+# hypothesis cannot fail no matter what the data says.
+#
+# These tests compose the two pure helpers -- the composition the fake skips.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("window", [(80.0, 120.0), (70.0, 130.0),
+                                    (50.0, 150.0), (100.0, 100.0)])
+def test_refuted_is_reachable_from_the_real_search_range(window):
+    """Some latency the search can actually return must classify as refuted.
+
+    Sweep the achievable range at 0.1 ms and require all three verdicts to be
+    possible. If only {supported, inconclusive} appear, the study is
+    unfalsifiable by construction.
+    """
+    lo_s, hi_s = _peak_search_bounds(window, times_lo=-0.1, times_hi=0.3)
+    lo_ms, hi_ms = lo_s * 1000.0, hi_s * 1000.0
+
+    verdicts = set()
+    n = int(round((hi_ms - lo_ms) / 0.1))
+    for i in range(n + 1):
+        verdicts.add(_classify(lo_ms + i * 0.1, window))
+
+    assert "refuted" in verdicts, (
+        f"window {window}: search range [{lo_ms:.1f}, {hi_ms:.1f}] ms can only "
+        f"produce {sorted(verdicts)} -- 'refuted' is unreachable, so the "
+        f"prediction cannot fail"
+    )
+
+
+@pytest.mark.parametrize("window", [(80.0, 120.0), (70.0, 130.0), (50.0, 150.0)])
+def test_late_refutation_is_always_reachable(window):
+    """The late side of the search must always extend past the refute threshold.
+
+    A genuine auditory peak arriving too late is the realistic way this
+    prediction fails, so this side must never be clamped shut.
+    """
+    _, hi_s = _peak_search_bounds(window, times_lo=-1.0, times_hi=1.0)
+    hi_ms = hi_s * 1000.0
+    assert _classify(hi_ms, window) == "refuted", (
+        f"window {window}: latest searchable peak {hi_ms:.1f} ms is not refuted"
+    )
+
+
+@pytest.mark.parametrize("window", [(80.0, 120.0), (70.0, 130.0), (50.0, 150.0)])
+def test_early_refutation_is_reachable_unless_physiology_floors_it(window):
+    """Early-side refutation may be legitimately unreachable -- but only for one
+    reason, and the reason must be the physiological floor.
+
+    For a window starting at 50 ms the plausibility band's early edge (30 ms)
+    coincides with ``_EARLIEST_CORTICAL_MS``, so the search cannot go below the
+    refute threshold. That is correct: "too early to be plausible" and "too early
+    to be a cortical response at all" have converged, and we decline to search
+    sub-cortical latencies just to manufacture a refutation. What must never
+    happen is the early side being closed by an arbitrary search margin -- which
+    is what the pre-2026-07-30 code did at every window.
+    """
+    lo_s, _ = _peak_search_bounds(window, times_lo=-1.0, times_hi=1.0)
+    lo_ms = lo_s * 1000.0
+    if _classify(lo_ms, window) != "refuted":
+        assert lo_ms == pytest.approx(_EARLIEST_CORTICAL_MS), (
+            f"window {window}: early refutation unreachable and the search floor "
+            f"({lo_ms:.1f} ms) is NOT the physiological floor "
+            f"({_EARLIEST_CORTICAL_MS} ms) -- an arbitrary margin has closed it"
+        )
+
+
+def test_stimulus_artifact_stays_outside_the_search():
+    """The original bug's regression guard, preserved while widening the search.
+
+    Widening the range to make `refuted` reachable must NOT reach back to the
+    ~15 ms stimulus artifact that the +/-100 ms search mistook for the M100.
+    """
+    lo_s, _ = _peak_search_bounds((80.0, 120.0), times_lo=-0.1, times_hi=0.3)
+    assert lo_s > 0.015, f"search starts at {lo_s * 1000:.1f} ms, at/below the artifact"
+    # And no window may drag the floor below the earliest plausible cortical response.
+    for window in [(80.0, 120.0), (50.0, 150.0), (100.0, 100.0)]:
+        lo_s, _ = _peak_search_bounds(window, times_lo=-1.0, times_hi=1.0)
+        assert lo_s >= 0.03, f"{window}: floor {lo_s * 1000:.1f} ms is sub-cortical"
 
 
 # ---------------------------------------------------------------------------

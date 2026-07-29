@@ -78,15 +78,49 @@ DEFAULT_BOUNDS: Dict[str, Any] = {
 
 # How far outside the expected window a measured peak must fall before the finding
 # is called ``refuted`` (rather than merely off-window). Inside the window ->
-# supported; clearly outside (beyond this margin) -> refuted; just off it ->
+# supported; outside the plausibility band -> refuted; between the two ->
 # inconclusive (not clear-cut either way).
-_REFUTE_MARGIN_MS = 50.0
+#
+# ASYMMETRIC on purpose. The M100 latency distribution is right-skewed: a genuine
+# auditory peak arriving late (attenuated stimulus, older subject, degraded SNR)
+# is ordinary, while one arriving materially EARLY is not physiological -- there
+# is no cortical auditory generator before ~50 ms. So allow more room late than
+# early before declaring the prediction refuted.
+_PLAUSIBLE_EARLY_MS = 20.0
+_PLAUSIBLE_LATE_MS = 60.0
 
-# Small symmetric slack (ms) added around the expected window when searching for
-# the peak, so a peak landing right at an edge is still captured. Deliberately
-# tiny: a wide search (the old +/-100 ms) grabbed the large early stimulus
-# artifact (~15 ms) instead of the in-window auditory peak (~100-120 ms).
-_PEAK_SEARCH_MARGIN_MS = 10.0
+# The earliest latency that can be a cortical auditory response at all. Floors
+# the peak search so it can never reach back to the ~15 ms stimulus artifact --
+# the original mis-measurement this module was fixed for.
+_EARLIEST_CORTICAL_MS = 30.0
+
+# How far the peak search extends BEYOND the plausibility band.
+#
+# This constant is what keeps the study falsifiable, and it is the whole reason
+# the block above is shaped this way. The peak is defined as the argmax INSIDE the
+# search range, so a range that stops at (or inside) the refutation threshold can
+# never yield a latency the classifier calls ``refuted``: the hypothesis becomes
+# unfalsifiable no matter what the data contains. That was the state of this file
+# before 2026-07-30 -- search was window +/-10 ms while refutation required
+# window +/-50 ms, so `refuted` was unreachable for EVERY configured window and
+# the only outcomes were {supported, inconclusive}.
+#
+# INVARIANT, enforced by tests/test_meg_study.py:
+#   the search range must strictly contain the refutation thresholds on both sides.
+# If you narrow the search to chase an artifact, widen it here or loosen the
+# plausibility band -- do not let them cross.
+_SEARCH_BEYOND_BAND_MS = 20.0
+
+
+def _plausible_band_ms(window_ms: Tuple[float, float]) -> Tuple[float, float]:
+    """The band outside which a measured peak counts as refuting the prediction.
+
+    Wider than the expected window (a peak just off the window is inconclusive,
+    not a refutation) and asymmetric (see ``_PLAUSIBLE_LATE_MS``). Pure, so the
+    falsifiability invariant is unit-testable without the scientific stack.
+    """
+    lo, hi = window_ms
+    return lo - _PLAUSIBLE_EARLY_MS, hi + _PLAUSIBLE_LATE_MS
 
 # Below this many epochs the evoked average is noise-dominated, so an out-of-
 # window (or absent) peak is more likely a weak-sample artifact than a real
@@ -104,16 +138,31 @@ def _peak_search_bounds(window_ms: Tuple[float, float],
     """Compute the (tmin, tmax) seconds to search for the evoked peak.
 
     Pure and mne-free so it is unit-testable without the scientific stack. The
-    search stays WITHIN the expected ``window_ms`` plus only a small symmetric
-    margin (``_PEAK_SEARCH_MARGIN_MS``), then is clamped to the available sample
-    times ``[times_lo, times_hi]`` (seconds).
+    search spans the plausibility band (``_plausible_band_ms``) plus
+    ``_SEARCH_BEYOND_BAND_MS`` on each side, is floored at
+    ``_EARLIEST_CORTICAL_MS``, then clamped to the available sample times
+    ``[times_lo, times_hi]`` (seconds).
 
-    This is the regression boundary for the M100 bug: a wide (+/-100 ms) search
-    over an 80-120 ms window reached back to the ~15 ms stimulus artifact and
-    reported it as the peak. Keeping the search in-window prevents that.
+    Two constraints are in tension here and both matter:
+
+    * The search must NOT reach the ~15 ms stimulus artifact. The original M100
+      bug used a +/-100 ms search over an 80-120 ms window, grabbed that artifact
+      and reported it as the peak. ``_EARLIEST_CORTICAL_MS`` is the floor that
+      prevents it -- a floor on physiology, not an arbitrary margin.
+    * The search MUST extend past the refutation thresholds, or ``refuted`` is
+      unreachable and the prediction cannot fail. Clamping the search tighter than
+      the plausibility band (the pre-2026-07-30 behaviour) silently converted a
+      falsifiable study into an unfalsifiable one.
+
+    Note the clamp to ``[times_lo, times_hi]`` can still break the invariant when
+    the recording is genuinely too short to contain the band -- that is a real
+    limit of the sample, not a classifier bug, and it correctly yields
+    ``inconclusive`` rather than a refutation the data cannot support.
     """
-    lo_s = window_ms[0] / 1000.0 - _PEAK_SEARCH_MARGIN_MS / 1000.0
-    hi_s = window_ms[1] / 1000.0 + _PEAK_SEARCH_MARGIN_MS / 1000.0
+    band_lo_ms, band_hi_ms = _plausible_band_ms(window_ms)
+    lo_s = max(band_lo_ms - _SEARCH_BEYOND_BAND_MS,
+               _EARLIEST_CORTICAL_MS) / 1000.0
+    hi_s = (band_hi_ms + _SEARCH_BEYOND_BAND_MS) / 1000.0
     lo = max(times_lo, lo_s)
     hi = min(times_hi, hi_s)
     return lo, hi
@@ -288,8 +337,9 @@ def _classify(latency_ms: Optional[float],
         return "inconclusive"           # degenerate sample / no measurable peak
     if lo <= latency_ms <= hi:
         return "supported"              # within the expected window
-    if latency_ms < lo - _REFUTE_MARGIN_MS or latency_ms > hi + _REFUTE_MARGIN_MS:
-        return "refuted"                # clearly outside
+    band_lo, band_hi = _plausible_band_ms(window_ms)
+    if latency_ms < band_lo or latency_ms > band_hi:
+        return "refuted"                # outside the plausibility band
     return "inconclusive"              # just off the window — not clear-cut
 
 
