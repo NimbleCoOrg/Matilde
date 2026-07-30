@@ -1,16 +1,43 @@
 name: sanitization
 
-# The commons gate. Runs on every PR. Scans ONLY the diff (fast, never
-# flaky-blocks a contributor on unrelated pre-existing content) — the full-tree
-# audit belongs in a scheduled/gardener lane, not per-PR.
+# The commons gate. Runs on every PR, scanning ONLY the diff (fast, and it never
+# flaky-blocks a contributor on unrelated pre-existing content). The full-tree
+# audit is a separate, on-demand lane — see sanitization-scheduled.yml.
 #
-# SECURITY NOTE for when you open this to untrusted forks: switch the trigger to
-# `pull_request_target` and check out the PR head explicitly, so the build-time
-# ANTHROPIC_API_KEY is never exposed to injected PR code. Until then, keep
-# `pull_request` (key only runs on trusted branches).
+# TWO STEPS, deliberately separate, so a red check names its own cause:
+#
+#   1. Secrets & PII (deterministic). No credential, no network. Runs on EVERY
+#      PR including forks. A red here means "a secret or PII is in the diff".
+#
+#   2. Particulars (semantic). Needs ANTHROPIC_API_KEY and runs with
+#      --require-semantic, so it FAILS CLOSED: if the key is missing, malformed,
+#      revoked, rate-limited, or the API is unreachable, the step exits 2 rather
+#      than printing a warning and passing. A red here means "the semantic layer
+#      found particulars, or could not run" — and the log says which.
+#
+#   Collapsing these into one step is what made this gate dishonest before: a
+#   broken key degraded to deterministic-only, printed a warning nobody reads,
+#   exited 0, and reported the repo clean. A green check has to mean the layers
+#   it claims actually ran.
+#
+# FORK PRs: GitHub does not expose repository secrets to `pull_request` runs from
+# a fork, so step 2 cannot run there at all. Those runs get step 1 plus a loud
+# annotation, and must be treated as partial: green means "no secrets found", NOT
+# "no particulars found". A maintainer reviews particulars by hand before merge.
+#
+# SECURITY NOTE — accepting external contributions:
+#   Making the semantic layer run on fork PRs requires switching the trigger to
+#   `pull_request_target`, which runs with repository secrets in a context where
+#   the PR's own code must NOT be trusted. Done carelessly — e.g. checking out
+#   the PR head and then executing anything from it — that hands
+#   ANTHROPIC_API_KEY to arbitrary attacker-supplied code. That is a deliberate
+#   maintainer decision, not a default, and it is intentionally NOT enabled here.
 
 on:
   pull_request:
+
+permissions:
+  contents: read
 
 jobs:
   sanitize:
@@ -18,6 +45,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          # Full history so the three-dot PR-range diff has a merge-base to work from.
           fetch-depth: 0
 
       - uses: actions/setup-python@v5
@@ -27,13 +55,38 @@ jobs:
       - name: Install deps (semantic layer + self-tests)
         run: pip install anthropic pytest
 
+      # The gate's own tests run BEFORE the gate. A scanner that cannot detect
+      # its own fixtures must never get to report a repo "clean".
       - name: Scanner self-tests (deterministic, no key needed)
         run: python -m pytest tests/test_check_sanitization.py -q
 
-      - name: Sanitization gate (diff)
+      - name: Resolve the diff against the base branch
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin "+refs/heads/${BASE_REF}:refs/remotes/origin/${BASE_REF}"
+          git diff --name-only "origin/${BASE_REF}...HEAD" > changed.txt
+          echo "changed files:"
+          cat changed.txt
+
+      # ---- Step 1: always enforced, no credential required ------------------
+      - name: Secrets & PII gate (deterministic — always enforced, no key needed)
+        run: |
+          set -euo pipefail
+          xargs -r -d '\n' python scripts/check_sanitization.py --deterministic-only < changed.txt
+
+      # ---- Step 2: same-repo PR — the key is available, so demand the layer --
+      - name: Particulars gate (semantic — needs ANTHROPIC_API_KEY, fails closed)
+        if: github.event.pull_request.head.repo.full_name == github.repository
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
-          BASE="origin/${{ github.base_ref }}"
-          git diff --name-only "$BASE...HEAD" \
-            | xargs -r python scripts/check_sanitization.py
+          set -euo pipefail
+          xargs -r -d '\n' python scripts/check_sanitization.py --require-semantic < changed.txt
+
+      # ---- Step 2': fork PR — no secret by design, say so loudly ------------
+      - name: Particulars gate NOT RUN (fork PR — no secret available)
+        if: github.event.pull_request.head.repo.full_name != github.repository
+        run: |
+          echo "::warning title=Partial sanitization coverage::This PR is from a fork, so ANTHROPIC_API_KEY is not available to the run and the SEMANTIC layer did not execute. Secrets and PII were checked; domain particulars were NOT. A maintainer must review this diff for particulars by hand before merging."
