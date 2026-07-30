@@ -1,0 +1,53 @@
+name: sanitization-full-tree
+
+# FULL-TREE sanitization audit — the detection backstop for the diff-only PR gate.
+#
+# Because the PR gate (sanitization.yml) scans only a PR's own diff, a leak can in
+# principle reach the default branch in a file no single PR touched: a rename, a
+# merge, an out-of-band edit, or content that predates the gate. This lane
+# re-scans the ENTIRE tree with both layers, fail-closed.
+#
+# Same two-step shape as the PR gate, for the same reason: a red step names its
+# own cause instead of leaving you guessing whether the key broke or a leak landed.
+#
+# ON-DEMAND ONLY, for now — and that is a deliberate, temporary state:
+#   The deterministic layer has been verified clean across the whole tree. The
+#   SEMANTIC layer has never run over the full tree here, so nobody knows yet
+#   whether pre-existing content carries particulars. Turning on a nightly cron
+#   before that first audit would very likely produce a recurring red that no one
+#   has triaged, and a gate people learn to ignore is worse than no gate.
+#
+#   TO ENABLE THE NIGHTLY LANE: run this workflow manually once
+#   (Actions → sanitization-full-tree → Run workflow), triage whatever the
+#   semantic layer reports, then uncomment the `schedule:` block below.
+on:
+  workflow_dispatch:
+  # schedule:
+  #   - cron: '17 9 * * *'   # daily, 09:17 UTC — see note above before enabling
+
+permissions:
+  contents: read
+
+jobs:
+  sanitize-full-tree:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install deps (semantic layer + self-tests)
+        run: pip install anthropic pytest
+
+      - name: Scanner self-tests (deterministic, no key needed)
+        run: python -m pytest tests/test_check_sanitization.py -q
+
+      - name: Full-tree secrets & PII gate (deterministic — always enforced, no key needed)
+        run: python scripts/check_sanitization.py --all --deterministic-only
+
+      - name: Full-tree particulars gate (semantic — needs ANTHROPIC_API_KEY, fails closed)
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: python scripts/check_sanitization.py --all --require-semantic
