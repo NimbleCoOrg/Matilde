@@ -43,6 +43,26 @@ def _tracked_markdown() -> list[Path]:
     return [ROOT / p for p in out]
 
 
+# A line carrying this marker is exempt from the shape scan. It exists for the
+# synthetic fixtures in the positive control below, which must contain the very
+# shapes the scan forbids. Deliberately verbose and greppable: `grep -rn
+# "leak-scan: synthetic" ` should return a short list a reviewer can eyeball, and
+# every hit should be an obvious fabrication. Never put it on a real value.
+_ALLOW_MARKER = "leak-scan: synthetic"
+
+
+def _tracked_test_sources() -> list[Path]:
+    """Test sources are in scope for the leak scan — including this file."""
+    out = subprocess.run(
+        ["git", "ls-files", "tests/*.py"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.split()
+    return [ROOT / p for p in out]
+
+
 def _rel(p: Path) -> str:
     return p.relative_to(ROOT).as_posix()
 
@@ -169,13 +189,22 @@ _PARTICULAR_SHAPES = [
 
 @pytest.mark.parametrize("label,pattern,why", _PARTICULAR_SHAPES, ids=[s[0] for s in _PARTICULAR_SHAPES])
 def test_no_instance_particular_shapes(label, pattern, why):
-    """No tracked markdown may carry instance-runtime shapes."""
+    """No tracked prose *or test source* may carry instance-runtime shapes.
+
+    Scans ``tests/*.py`` as well as markdown, and the reason is a caught leak:
+    the first revision of this file put a real Discord guild ID in the sample
+    dict below. Every markdown file was clean, so the suite was green while the
+    leak sat in the scanner itself. A detector that cannot see the file it is
+    written in has a blind spot exactly where a careless edit lands.
+    """
     hits = []
-    for path in _tracked_markdown():
+    for path in _tracked_markdown() + _tracked_test_sources():
         for n, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+            if _ALLOW_MARKER in line:
+                continue
             if pattern.search(line):
                 hits.append(f"{_rel(path)}:{n} ({why})")
-    assert not hits, f"{label} found in tracked markdown:\n  " + "\n  ".join(hits)
+    assert not hits, f"{label} found in tracked files:\n  " + "\n  ".join(hits)
 
 
 def test_particular_shape_patterns_actually_match():
@@ -186,9 +215,14 @@ def test_particular_shape_patterns_actually_match():
     strings here are synthetic.
     """
     samples = {
-        "operator-host-path": "the file at /home/analyst/data lives there",
-        "raw-data-filename": "recorded as SITE_1999_01_02_SUBJ01.wav today",
-        "chat-platform-snowflake": "channel 1531073024047059106 was used",
+        "operator-host-path": "the file at /home/analyst/data lives there",  # leak-scan: synthetic
+        "raw-data-filename": "recorded as SITE_1999_01_02_SUBJ01.wav today",  # leak-scan: synthetic
+        # Fabricated, and it must stay fabricated. An earlier revision of this
+        # dict used a real Discord guild ID from the instance this package was
+        # promoted from -- inside the positive control for the leak detector,
+        # under a docstring asserting the strings are synthetic. The scan below
+        # only walked tracked *.md, so nothing caught it.
+        "chat-platform-snowflake": "channel 1000000000000000001 was used",  # leak-scan: synthetic
     }
     for label, pattern, _why in _PARTICULAR_SHAPES:
         assert pattern.search(samples[label]), f"{label} pattern matched nothing"
