@@ -194,6 +194,59 @@ Full case study and rules: `docs/trustworthy-comparison.md`. Results-file
 requirements: `docs/results-provenance-checklist.md`. Enforcement in code:
 `matilde_plugin/engine/comparison.py`.
 
+### Before you report an evaluation number
+
+A comparison needs both arms to be comparable (above). A *single* number still
+needs to mean what you think it means. State, in the same message as the number:
+**n**; the **split unit** (file, subject, session, site) and whether you verified
+disjointness *at that unit* — file-disjoint is not subject-disjoint; the **scoring
+criterion**; **where the operating point was chosen**; the artifact's **content
+hash, not its path**; and **what you did not check**.
+
+Two things that decide whether the number is interpretable at all, and are
+routinely skipped:
+
+- **Know your ceiling.** A score against human labels is agreement with one
+  person's judgment. Without an estimate of how well two annotators agree, you
+  cannot distinguish improvement from fitting one annotator's habits.
+- **Compare the effect to your configuration noise.** If a preprocessing knob
+  moves the metric more than the effect you are claiming, you are measuring
+  configuration, not method.
+
+**And diff against the previous run before checking anything else.** Per-artifact
+validation is structurally blind to reversals: every arithmetic check can pass on
+a run whose headline conclusion has flipped since last week. A number that moved
+is a finding; a number that reversed is a headline.
+
+Full method: [evaluation-validity.md](references/evaluation-validity.md).
+
+### Before you trust a guard, check that something calls it
+
+A guard invoked by choice is not a guard. Before reporting a result that a
+correctness helper was supposed to protect, **say which helpers you actually
+called** — if the answer is not all of them, that is the finding. And when a
+check's *negative* result is load-bearing ("nothing was found", "no overlap",
+"the file is absent"), **first prove the check can return a positive.** Absence is
+the one answer that a broken check and a true finding produce identically.
+
+Full method: [enforcement-ladder.md](references/enforcement-ladder.md).
+
+### Know how you fail
+
+Your failure mode is not fabrication — it is that you verify less when producing
+than when reviewing. Four specific distortions, each observed in production:
+conversational pressure trades verification for resolution; default affirmation
+makes your agreement uninformative; a derived value restated on a schedule starts
+reading as an observation; and a limitation you wrote down once is a claim with a
+date on it that nothing ever re-checks.
+
+Two habits that follow. **Report what you did and what you verified separately** —
+"I called it, it returned success, I did not confirm it persisted" is usable; "✅
+Done" is not. And **re-check a capability before declining on the strength of it**;
+a false "I can't" is silent forever, while a false "I can" fails loudly at once.
+
+Full method: [agent-failure-modes.md](references/agent-failure-modes.md).
+
 ## Iteration Pattern
 
 1. **Gather** candidate sources

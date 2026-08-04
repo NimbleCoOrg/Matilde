@@ -1,8 +1,8 @@
 # Contributing to {{PACKAGE_NAME}}
 
-> New here? Read [docs/onboarding-contributors.md](docs/onboarding-contributors.md)
-> first — the one-sitting tour of the layout and the one rule that matters most.
-> This file is the detailed reference.
+> New here? Read [docs/onboarding.md](docs/onboarding.md) first — the one-sitting
+> tour of the layout and the one rule that matters most. This file is the detailed
+> reference.
 
 `{{PACKAGE_NAME}}` is the shared, generic {{DOMAIN}} capability package — plugins,
 skills, tools, and the agent's base soul. Operators run private instances on top of
@@ -114,3 +114,17 @@ could use, a sanitization improvement, a workflow change — see
 [docs/promotion-and-upstream.md](docs/promotion-and-upstream.md) for the promotion
 flow: how to extract and sanitize work from your private instance into a publishable
 form, and how to submit upstream to the HSM base.
+
+**Deciding *what* to promote** — whether a lesson an instance learned the hard way
+is general enough to ship to every instance, or belongs only to the one that learned
+it — is [docs/lesson-promotion-filter.md](docs/lesson-promotion-filter.md). Use it
+before you write the PR, and record the rules you *rejected* and why: the rejected
+list is how the next contributor calibrates.
+
+**Where a promoted lesson goes.** `docs/` is for contributors and is not shipped to
+instances. Only `hermes-skill/`, `matilde_plugin/` and `docker/SOUL*` reach a
+deployed agent. If an agent must act on the rule, it belongs in
+`hermes-skill/references/` with a pointer from `SKILL.md` at the point in the
+workflow where it would be violated — a reference nothing loads is documentation,
+not a control. And merging is not shipping: see
+[docs/deployment-reach.md](docs/deployment-reach.md).

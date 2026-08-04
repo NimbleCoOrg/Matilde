@@ -46,6 +46,13 @@ if the technique only worked once, it hasn't earned generalization yet.
    The act of generalizing **is** the proof that nothing leaked. If you can't
    describe the method without the particulars, it isn't generalized yet.
 
+   **This step has its own document.** Deciding *which* rules survive the strip —
+   especially the ones stated in one domain's vocabulary whose mechanism is
+   domain-free — is [lesson-promotion-filter.md](lesson-promotion-filter.md). It
+   gives four ordered tests, worked verdicts on real material, and the rule that
+   the unit of promotion is a **rule**, not a file: expect a single instance
+   document to split, some of it promoting and some staying.
+
 2. **PR it from a branch into `main`.** Branch from `main`, open the PR against
    `main`.
 
