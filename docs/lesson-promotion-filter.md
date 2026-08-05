@@ -54,7 +54,7 @@ signal available, and it misfires in *both* directions:
 | "Look at your spectrograms before reporting a segmentation number." | "Look at your figures before reporting a number derived from them." | **General.** Sounds maximally domain-bound; the mechanism ("a result you have never viewed is a number, not an observation") is universal. |
 | "The guard fires after training and before the result writes, so a refusal discards the whole run and produces nothing." | "A guard whose refusal discards the work costs a run, not a report." | **General.** A hyper-specific artifact carrying a fully general rule about where in a pipeline a check belongs. |
 | "The identifier is at the fifth underscore-delimited position of the filename." | "The identifier is parseable from the filename." | **Specific.** The substituted form is content-free; all the value was in the parsing recipe. |
-| "Filter the label taxonomy from 41 families to 14 by a minimum-count threshold." | "Any data-selection threshold must be recorded, and the result shown at a second cut." | **General — but only the second sentence.** The counts and the taxonomy stay; the rule about undocumented selection thresholds travels. This is the split described above, inside one sentence. |
+| "Filter the label taxonomy from 41 families to 14 by a minimum-count threshold." | "Any data-selection threshold must be recorded, and the result shown at a second cut." | **General — but only the second sentence.** The taxonomy's identity stays; the rule about undocumented selection thresholds travels, and the counts travel with it as derived evidence (T3). This is the split described above, inside one sentence. |
 
 **T1 is the test the brief's hard case needs.** "Score every arm with the same
 matcher" reads as bioacoustics and is a general experimental-design rule; T1
@@ -175,7 +175,7 @@ value is in the cases where it says *no* and the cases where it surprises you.
 
 | Material | Failed on |
 |---|---|
-| Label-taxonomy family/label counts and the specific class filter. | T1 — substitutes to a truism; only the "record your selection threshold" rule travels. |
+| The taxonomy's identity and the specific class filter — *which* taxonomy, and which classes it kept. The raw counts are derived quantities and travel with the rule under T3, as its evidence. | T1 — the filter itself substitutes to a truism; only the "record your selection threshold" rule travels (promoted as E5 in `hermes-skill/references/evaluation-validity.md`). |
 | Identifier parsing from filenames. | T1 — the recipe *is* the content, and the filenames are raw material anyway. |
 | Script paths, flags and per-tool evaluation entry points. | T2 — unusable outside the instance. |
 | Corpus names, sites, per-recording labels, collaborator names. | T3 — hard block. |
