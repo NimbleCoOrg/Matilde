@@ -170,7 +170,17 @@ something specific went wrong, and says what.
 | [golden-validation-recipe.md](docs/golden-validation-recipe.md) | The offline, dependency-free worked validation — the reference shape of a correct finding, and the package's smoke test. |
 | [meg-validation-study.md](docs/meg-validation-study.md) · [stateful-study-pipeline.md](docs/stateful-study-pipeline.md) | Running a memory-bounded study over an open dataset, and the resumable step store that makes it restartable. |
 | [privacy-and-visibility.md](docs/privacy-and-visibility.md) · [promotion-and-upstream.md](docs/promotion-and-upstream.md) | The privacy model, the sanitization gate, and how a technique gets promoted out of a private overlay into this package. |
+| [lesson-promotion-filter.md](docs/lesson-promotion-filter.md) | The four tests that decide whether a lesson an instance learned is general (ships to everyone) or specific (stays local), with worked verdicts including the ones that failed. |
+| [deployment-reach.md](docs/deployment-reach.md) | Why a merged rule is not a running rule: the four manual steps between `main` and a deployed agent, and an assessment of the re-apply endpoint as the delivery mechanism. |
 | [onboarding.md](docs/onboarding.md) | Start here if you are new to the package. |
+
+The skill ships its own reference set in `hermes-skill/references/`, which is
+installed alongside `SKILL.md` and is therefore readable by a running agent:
+`evaluation-validity.md` (what one number means, and the trajectory check),
+`enforcement-ladder.md` (available / default / gated, and positive controls), and
+`agent-failure-modes.md` (how verification degrades under pressure). Documents in
+`docs/` are for contributors and are **not** shipped to instances — put anything an
+agent must act on in `hermes-skill/references/`.
 
 ---
 
