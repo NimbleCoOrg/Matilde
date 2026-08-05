@@ -63,15 +63,15 @@ The install is **destructive at directory granularity**. With overwrite set — 
 re-apply always sets — the existing artifact directory is removed recursively and
 replaced with the fetched contents. It is not a merge and not a three-way update.
 
-For the instance that motivated this document, that means re-applying the template
-right now would **delete about thirty reference documents that exist in no
-repository anywhere**, and replace the directory with the single file this package
-currently ships. Among the files destroyed would be the entire batch of lessons
-this promotion pass exists to harvest.
+**Re-applying against a hand-edited runtime deletes any file the runtime holds
+that the template does not** — including, in the observed case, the entire batch a
+promotion pass was harvesting. Reference documents that exist in no repository
+anywhere are replaced by whatever the package currently ships, and nothing in the
+call reports what was lost.
 
 The SOUL is protected from exactly this, deliberately and with a comment
-explaining why. The reasoning applies with equal force to a skill directory an
-operator has been editing for six weeks, and it has not been extended there.
+explaining why. The reasoning applies with equal force to any artifact directory
+an operator can edit in place, and it has not been extended there.
 
 **Verdict: right mechanism, wrong preconditions.** The endpoint is the correct
 long-term delivery path — it is gated, targeted, audited, and idempotent. It is
@@ -107,21 +107,28 @@ one hard sequencing constraint.
 
 ---
 
-## Named next steps, with their risks
+## The design change this implies
 
-Out of scope for the promotion pass that produced this document. Stated precisely
-so they can be picked up rather than rediscovered.
+One recommendation about the mechanism, stated as a property the mechanism should
+have rather than as anyone's task.
 
-| # | Step | Risk if done wrong |
-|---|---|---|
-| C1 | Commit the deployed artifact directory to the instance's private repo, unmodified. | **Highest priority and time-sensitive.** Any re-apply before this is irreversible loss of ~30 documents. |
-| C2 | Make re-apply non-destructive, or make it refuse. Either merge rather than replace, or detect that the destination contains files absent from the source and fail with a diff instead of proceeding. Extending the SOUL's existing carve-out is the smaller change. | Until then the endpoint is a foot-gun aimed at exactly the agents that have been used most. A "refuse and report" version is strictly better than nothing and much cheaper than a merge. |
-| C3 | Cut a release tag from `main` and bump the template registry pin. | Low risk; without it, steps 1–3 of the path above are dead and nothing here ever ships. |
-| C4 | Give instance-local material a path the template does not own. | Without it, C2 and C3 together still delete instance content on every update — the problem returns on the next cycle rather than being solved. |
-| C5 | Add a check that reports, per deployed agent, the template tag its artifacts came from versus the registry's current pin. | Drift is currently invisible. Nobody knew the runtime was months stale, and nobody could have known without looking by hand. |
+**A template re-apply should be non-destructive, or it should refuse.** Either
+merge rather than replace, or detect that the destination holds files absent from
+the source and fail with that diff instead of proceeding. A carve-out for exactly
+this risk already exists for the identity file; the reasoning extends to any
+artifact directory an operator can edit in place, and extending it is the smaller
+change.
 
-C1 is the only one that is urgent. C2 is the only one that makes the mechanism
-safe to use routinely. C3 is the only one that makes any of this reach an agent.
+Until one of those holds, the endpoint is a foot-gun aimed at precisely the agents
+that have been used most — an agent accumulates local material *because* someone
+worked with it, so the destructive case and the valuable case are the same case. A
+"refuse and report" version is strictly better than nothing and much cheaper than
+a real merge.
+
+The corollary for whoever owns the delivery path: instance-local material needs a
+home the template does not own — an overlay directory outside the artifact path,
+or a separate instance-scoped artifact. Without one, a non-destructive re-apply
+only postpones the deletion to the cycle after next.
 
 ---
 

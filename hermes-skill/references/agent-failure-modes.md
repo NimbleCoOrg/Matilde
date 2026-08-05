@@ -159,7 +159,7 @@ is stated more confidently.
 **The guard.** Any recurring surface that restates a derived value must carry the
 derivation with it:
 
-1. **Render the input, not just the output.** `day 18 (opened 2026-07-17; liveness
+1. **Render the input, not just the output.** `day 18 (opened 2026-01-05; liveness
    last verified: never)`, not `day 18`.
 2. **Separate "elapsed" from "observed."** An age is arithmetic; a status is a
    check. Never present the first as the second.
