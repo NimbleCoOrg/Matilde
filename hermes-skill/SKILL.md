@@ -203,7 +203,7 @@ disjointness *at that unit* — file-disjoint is not subject-disjoint; the **sco
 criterion**; **where the operating point was chosen**; the artifact's **content
 hash, not its path**; and **what you did not check**.
 
-Two things that decide whether the number is interpretable at all, and are
+Three things that decide whether the number is interpretable at all, and are
 routinely skipped:
 
 - **Know your ceiling.** A score against human labels is agreement with one
@@ -212,6 +212,11 @@ routinely skipped:
 - **Compare the effect to your configuration noise.** If a preprocessing knob
   moves the metric more than the effect you are claiming, you are measuring
   configuration, not method.
+- **A checkpoint cannot enforce its own preprocessing contract.** Loading a saved
+  model verifies none of the sampling, transform, scaling or normalisation it was
+  trained under, and nothing errors when they differ — it just answers a different
+  question. Import the preprocessing the training run used instead of retyping it,
+  and never assume a checkpoint you did not train here matches this script.
 
 **And diff against the previous run before checking anything else.** Per-artifact
 validation is structurally blind to reversals: every arithmetic check can pass on

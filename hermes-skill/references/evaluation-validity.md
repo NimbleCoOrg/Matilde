@@ -115,9 +115,9 @@ Choices in that project that were never justified and never swept:
 - Two variants of the "same" pipeline read input at different sampling rates — one
   at the source rate, one resampled — giving different time–frequency resolution
   from the same raw data. A declared rate constant in one of them was never read.
-- A linear-power representation where the field standard is log-magnitude. On a
-  linear scale the loudest component dominates and the quiet transitions — exactly
-  what was being detected — compress toward zero.
+- A linear-amplitude representation where the field standard is logarithmic. On a
+  linear scale the loudest component dominates and low-amplitude structure —
+  which was exactly what the task had to detect — compresses toward zero.
 - Per-item normalisation computed over the whole item, including the scored region.
 
 Each is a defensible choice. None had been recorded as a choice.
@@ -141,6 +141,59 @@ threshold that appeared in no provenance block anywhere.
   families" and "1.2% of examples" are very different situations.
 - **Show the result at one other cut.** If the conclusion only holds at your
   chosen threshold, that is the finding.
+
+## E6 — A checkpoint carries a contract it cannot enforce
+
+A saved model encodes assumptions about how its input was prepared — sampling or
+resolution, the transform applied, scaling, the scope over which normalisation was
+computed. **Loading it checks none of them.** Nothing errors when they are
+violated: the shapes still match, the forward pass still runs, a number still comes
+out. The model simply answers a different question than the one you asked, and
+answers it with the same confidence.
+
+This is E4's mechanism at a worse position. E4 is about a knob you can still sweep.
+Here the knob was set once, by a training run you may not have watched, and the
+setting is stored nowhere the loading code can read.
+
+**The parameters can look identical while the preprocessing differs, because the
+quantity that has to match is usually *derived*.** Two configurations with the same
+window length and the same hop still produce different time resolution if the input
+rate differs — what must match is hop ÷ sample rate, the seconds each frame covers,
+and neither constant alone reveals it. **Report the derived quantity, not the
+constants it came from.** A table of matching constants is not evidence that two
+runs are comparable; it is evidence that two people wrote down the same numbers.
+
+The magnitudes are not subtle. One observed mismatch cost **0.133 F1** on unchanged
+weights and unchanged data. E4's example — a knob that moved F1 from 0.826 to 0.595
+— is the same mechanism caught one stage earlier, while it was still a knob.
+
+**What to do**
+
+- **Write the preprocessing signature into the checkpoint at save time, and assert
+  it on load.** Rate, transform, window, hop, scaling, normalisation scope —
+  whatever the model actually depended on — stored beside the weights, and
+  **refuse to run on mismatch.** It is a few lines, and it converts a silent large
+  error into a loud stop. It is also the only rung of the enforcement ladder that
+  survives a contributor who never read this file.
+- **Never retype a preprocessing function into a new script — import the one
+  training used.** A reimplementation is a new program wearing an old name. It will
+  agree with the original on the cases you check and diverge on the ones you do
+  not. If the training code cannot be imported, that is itself the finding; say so
+  rather than quietly writing a second version.
+- **Treat a borrowed checkpoint as the high-risk case.** If you did not train these
+  weights *in this script*, you may not assume this script's preprocessing matches
+  them. The intuition runs the wrong way here: inherited weights feel more settled
+  than freshly trained ones, and they are precisely the ones whose contract nobody
+  has verified.
+- **An ablation whose arms differ in more than one respect does not attribute its
+  delta.** A different checkpoint *and* different preprocessing, a new component
+  *and* a re-fitted baseline — the difference belongs to no single factor. Say the
+  comparison is unattributable instead of reporting the number. That is not a
+  weaker result; it is a different kind of claim.
+
+> A checkpoint is a promise about its inputs that the file format has no way to
+> keep. Either you write the promise down and check it on load, or you are trusting
+> a memory of a decision nobody recorded.
 
 ---
 
