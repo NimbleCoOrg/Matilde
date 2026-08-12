@@ -190,7 +190,7 @@ def download_file(dataset_id: str, filename: str, dest_path: str,
 
 def _user_agent() -> str:
     contact = os.environ.get("MATILDE_CONTACT_EMAIL", "").strip()
-    base = "Matilde/0.1 (https://github.com/NimbleCoAI/Matilde)"
+    base = "Matilde/0.1 (https://github.com/cyborg-garden/Matilde)"
     return f"{base} mailto:{contact}" if contact else base
 
 
