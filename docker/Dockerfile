@@ -3,7 +3,7 @@
 # Build:
 #   docker build -f docker/Dockerfile \
 #     -t {{IMAGE_NAME}}:<tag> \
-#     --build-arg BASE_IMAGE=ghcr.io/nimblecoai/hermes-agent-mt:<sha> .
+#     --build-arg BASE_IMAGE=ghcr.io/cyborg-garden/hermes-agent-mt:<sha> .
 #
 # DESIGN — three load-bearing decisions (each corresponds to a real failure mode
 # against the hermes-agent-mt base; do not undo them):
@@ -27,7 +27,7 @@
 # Net effect: a thin, s6-clean layer that turns any hermes-agent-mt image into
 # one whose shell has your domain toolchain on PATH.
 
-ARG BASE_IMAGE=ghcr.io/nimblecoai/hermes-agent-mt:latest
+ARG BASE_IMAGE=ghcr.io/cyborg-garden/hermes-agent-mt:latest
 FROM ${BASE_IMAGE}
 
 USER root
